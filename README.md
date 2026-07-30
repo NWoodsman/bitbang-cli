@@ -237,10 +237,9 @@ GOOS=darwin  GOARCH=arm64        go build -o bitbang-macos ./cmd/bitbang/
 
 Shipping today: **shell, files, and proxy**, reachable from the browser or the CLI, plus scp-style file copy and **ad-hoc pairing** with a saved device table. Designed and on the way:
 
-- **Serial bridging** -- drive a remote `/dev/ttyUSB0` from a local virtual port (e.g. run Arduino IDE over the internet).
-- **TCP port forwarding** -- `-L 5432:db.internal:5432` to reach LAN-only services.
+- **Serial bridging** -- drive a remote `/dev/ttyUSB0` from a local virtual port (e.g. run Arduino IDE over the internet). An issue has been opened [here](https://github.com/richlegrand/bitbang-cli/issues/3).
+- **TCP port forwarding** -- `-L 5432:db.internal:5432` to reach LAN-only services. And issue has been opened [here](https://github.com/richlegrand/bitbang-cli/issues/4).
 - **Remote desktop** -- screen over a WebRTC video track, keyboard/mouse over the data channel.
-- **Network mode** -- team/fleet access with "network tokens", device/service discovery, and audit logging.
 
 ## License
 
