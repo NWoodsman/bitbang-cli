@@ -9,8 +9,17 @@ import (
 	"sync"
 
 	"github.com/gorilla/websocket"
+	"github.com/richlegrand/bitbang/internal/localdns"
 	"github.com/richlegrand/bitbang/internal/protocol"
 )
+
+// wsDialer mirrors websocket.DefaultDialer but resolves .local targets over
+// mDNS, which a CGO_ENABLED=0 build cannot do through the system resolver.
+var wsDialer = &websocket.Dialer{
+	Proxy:            websocket.DefaultDialer.Proxy,
+	HandshakeTimeout: websocket.DefaultDialer.HandshakeTimeout,
+	NetDialContext:   localdns.Default.DialContext,
+}
 
 // WSHandler implements StreamHandler for type="websocket". Bridges a SWSP
 // WebSocket-on-stream-N to a real ws:// connection to a local server.
@@ -114,7 +123,7 @@ func (h *WSHandler) bridge(s Stream, pathname, cookies string) {
 	if ip := net.ParseIP(h.BrowserIP); ip != nil {
 		header.Set("X-Forwarded-For", ip.String())
 	}
-	conn, _, err := websocket.DefaultDialer.Dial(wsURL, header)
+	conn, _, err := wsDialer.Dial(wsURL, header)
 	if err != nil {
 		log.Printf("WS connect failed: %s -> %v", pathname, err)
 		_ = s.WriteFIN(nil)

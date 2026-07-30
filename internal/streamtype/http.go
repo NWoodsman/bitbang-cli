@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/richlegrand/bitbang/internal/localdns"
 	"github.com/richlegrand/bitbang/internal/protocol"
 )
 
@@ -111,6 +112,9 @@ func (h *HTTPHandler) OnConnect(path string) error {
 		requiresHTTPS := false
 		probeURL := fmt.Sprintf("http://%s/", h.connTarget)
 		probeClient := &http.Client{
+			// mDNS-aware: a CGO_ENABLED=0 build cannot resolve .local
+			// targets (nas.local and friends) through the system resolver.
+			Transport: localdns.Transport(),
 			CheckRedirect: func(r *http.Request, via []*http.Request) error {
 				if r.URL.Scheme == "https" {
 					requiresHTTPS = true
@@ -270,6 +274,9 @@ func (h *HTTPHandler) proxyRequest(s Stream, req protocol.Request, body io.Reade
 	httpReq.Header.Set("Referer", fmt.Sprintf("http://%s/", target))
 
 	client := &http.Client{
+		// Shared mDNS-aware transport -- also preserves the connection pool
+		// across these per-request clients.
+		Transport: localdns.Transport(),
 		CheckRedirect: func(r *http.Request, via []*http.Request) error {
 			if r.URL.Host != "" && r.URL.Host != target {
 				h.connTarget = r.URL.Host
