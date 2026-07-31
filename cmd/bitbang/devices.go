@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -82,7 +83,7 @@ func bitbangDir() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("home dir: %w", err)
 	}
-	return home + "/.bitbang", nil
+	return filepath.Join(home, ".bitbang"), nil
 }
 
 func devicesPath() (string, error) {
@@ -90,7 +91,7 @@ func devicesPath() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return dir + "/devices.json", nil
+	return filepath.Join(dir, "devices.json"), nil
 }
 
 // loadDeviceTable reads devices.json. A missing file yields an empty table; a
@@ -122,7 +123,7 @@ func writeDeviceTable(t deviceTable) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("mkdir %s: %w", dir, err)
 	}
-	path := dir + "/devices.json"
+	path := filepath.Join(dir, "devices.json")
 	out, err := json.MarshalIndent(t, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal: %w", err)

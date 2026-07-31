@@ -82,9 +82,11 @@ func TestLegacyPEMRejected(t *testing.T) {
 }
 
 func TestLoadCreatesAndReloads(t *testing.T) {
-	// Redirect HOME so we don't touch the user's real ~/.bitbang.
+	// Redirect both Unix and Windows home variables so we don't touch the
+	// user's real ~/.bitbang. os.UserHomeDir uses USERPROFILE on Windows.
 	tmp := t.TempDir()
 	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
 
 	first, err := Load("bitbangproxy-test", false)
 	if err != nil {

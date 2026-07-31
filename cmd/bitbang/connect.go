@@ -223,7 +223,7 @@ func setupInteractive(opts *client.ShellOptions) func() {
 
 	resizes := make(chan client.ShellSize, 4)
 	winch := make(chan os.Signal, 4)
-	signal.Notify(winch, syscall.SIGWINCH)
+	notifyWindowChanges(winch)
 	go func() {
 		for range winch {
 			if cols, rows, err := term.GetSize(int(os.Stdin.Fd())); err == nil {

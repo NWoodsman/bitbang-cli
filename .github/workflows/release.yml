@@ -15,13 +15,22 @@ jobs:
     strategy:
       matrix:
         include:
-          - arch: amd64
+          - os: linux
             goarch: amd64
-          - arch: arm64
+            asset: bitbang-linux-amd64
+          - os: linux
             goarch: arm64
-          - arch: armv7
+            asset: bitbang-linux-arm64
+          - os: linux
             goarch: arm
             goarm: "7"
+            asset: bitbang-linux-armv7
+          - os: windows
+            goarch: amd64
+            asset: bitbang-windows-amd64.exe
+          - os: windows
+            goarch: arm64
+            asset: bitbang-windows-arm64.exe
 
     steps:
       - uses: actions/checkout@v4
@@ -32,21 +41,21 @@ jobs:
 
       - name: Build
         env:
-          GOOS: linux
+          GOOS: ${{ matrix.os }}
           GOARCH: ${{ matrix.goarch }}
           GOARM: ${{ matrix.goarm }}
           CGO_ENABLED: "0"
-        run: go build -ldflags "-s -w" -o bitbang-linux-${{ matrix.arch }} ./cmd/bitbang/
+        run: go build -ldflags "-s -w" -o ${{ matrix.asset }} ./cmd/bitbang/
 
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v2
         with:
-          subject-path: bitbang-linux-${{ matrix.arch }}
+          subject-path: ${{ matrix.asset }}
 
       - name: Upload to release
         uses: softprops/action-gh-release@v2
         with:
-          files: bitbang-linux-${{ matrix.arch }}
+          files: ${{ matrix.asset }}
 
   # Aggregates SHA-256 sums of every uploaded binary into a single
   # checksums.txt and attaches it to the release. install.sh fetches this
@@ -63,12 +72,12 @@ jobs:
           mkdir release
           gh release download "${{ github.event.release.tag_name }}" \
               --repo "${{ github.repository }}" \
-              --pattern 'bitbang-linux-*' \
+              --pattern 'bitbang-*' \
               --dir release
 
       - name: Generate checksums
         working-directory: release
-        run: sha256sum bitbang-linux-* > checksums.txt
+        run: sha256sum bitbang-* > checksums.txt
 
       - name: Upload checksums to release
         uses: softprops/action-gh-release@v2

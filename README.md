@@ -96,7 +96,10 @@ curl -sSfL bitba.ng/install | sh -s -- --prefix /usr/local/bin
 curl -sSfL bitba.ng/install -o install.sh && less install.sh && sh install.sh
 ```
 
-macOS and Windows builds are coming -- issues have been created for each ([macOS](https://github.com/richlegrand/bitbang-cli/issues/2), [windows](https://github.com/richlegrand/bitbang-cli/issues/1), just react or post to show me you're insterested . **Manual install:** download the binary from Releases and place it on your PATH. **Build from source:** see [below](#building-from-source).
+Windows builds are published as `bitbang-windows-amd64.exe` and
+`bitbang-windows-arm64.exe`. Download the appropriate binary from Releases,
+rename it to `bitbang.exe`, and place it on your `PATH`. macOS builds are still
+pending. **Build from source:** see [below](#building-from-source).
 
 ### How the install URL works
 
@@ -164,7 +167,7 @@ bitbang help                           Usage (also --help, -h)
 
 | Flag                    | Default               | Description                                   |
 | ----------------------- | --------------------- | --------------------------------------------- |
-| `-shell-cmd CMD`        | `$SHELL` or `/bin/sh` | Shell to spawn                                |
+| `-shell-cmd CMD`        | platform shell        | `$SHELL`/`/bin/sh` on Unix; `%COMSPEC%`/`cmd.exe` on Windows |
 | `-shell-max-sessions N` | `1`                   | Max concurrent shell sessions (0 = unlimited) |
 | `-shell-mirror`         | on                    | Mirror shell output to the listener's console |
 
@@ -235,6 +238,20 @@ GOOS=linux   GOARCH=arm GOARM=7  go build -o bitbang-armv7 ./cmd/bitbang/
 GOOS=windows GOARCH=amd64        go build -o bitbang.exe   ./cmd/bitbang/
 GOOS=darwin  GOARCH=arm64        go build -o bitbang-macos ./cmd/bitbang/
 ```
+
+From Windows Command Prompt:
+
+```bat
+go build -o bitbang.exe .\cmd\bitbang
+go test .\...
+run_tests.cmd unit
+```
+
+Shell commands, file sharing, proxying, and the CLI client are supported on
+Windows. Interactive browser and CLI shells use Windows ConPTY, including
+terminal input echo, line editing, VT output, and resize events. ConPTY requires
+Windows 10 version 1809 or Windows Server 2019 or later.
+
 ## Diagrams
 
 <p align="center">
