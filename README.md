@@ -118,6 +118,7 @@ The install script lives in this repo, next to the code it installs -- so you ca
 - **The secret never touches the server.** The access code lives in the URL fragment (`#…`), which browsers never send -- `bitba.ng` brokers the connection without ever seeing the credential that authorizes it.
 - **End-to-end encryption.** All traffic rides WebRTC's DTLS. The signaling server sees only the public key, the derived UID, and connection metadata -- never your data. A TURN relay, if one is needed, sees ciphertext only.
 - **Verified pairing.** The read-aloud number in code pairing is a short authentication string (SAS), computed independently on both ends from the negotiated DTLS fingerprints and two committed nonces -- a machine-in-the-middle, whose fingerprints necessarily differ, can't make the two numbers match.
+- **The URL is a bearer credential.** Anyone who has it gets whatever you chose to serve -- a shell, if you ran `serve shell`. Share it accordingly.
 - **Optional PIN** (`--pin`) for permanent or headless setups, and **throwaway mode** (`-ephemeral`) for a fresh identity each run.
 
 How the two ends authenticate each other without trusting the signaling server is covered in detail here: [*Trustless Signaling: Authentication Without a Central Authority*](https://github.com/richlegrand/bitbang/blob/main/trustless-signaling.md).
@@ -265,6 +266,7 @@ Shipping today: **shell, files, and proxy**, reachable from the browser or the C
 
 - **Serial bridging** -- drive a remote `/dev/ttyUSB0` from a local virtual port (e.g. run Arduino IDE over the internet). An issue has been opened [here](https://github.com/richlegrand/bitbang-cli/issues/3).
 - **TCP port forwarding** -- `-L 5432:db.internal:5432` to reach LAN-only services. And issue has been opened [here](https://github.com/richlegrand/bitbang-cli/issues/4).
+- **Terminal sharing** -- turn a *running* terminal session into a URL -- walk away mid-task and reopen it on your phone, or hand the link to someone else, perhaps useful for AI coding sessions. An issue has been opened [here](https://github.com/richlegrand/bitbang-cli/issues/5).
 - **Remote desktop** -- screen over a WebRTC video track, keyboard/mouse over the data channel.
 
 ## License
