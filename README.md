@@ -31,9 +31,18 @@ When you can't paste a URL or scan a QR code, such as when you're on the phone, 
 - **Private by design.** Traffic is WebRTC/DTLS, peer-to-peer. The signaling server never sees it; if a direct path isn't possible, a TURN relay carries ciphertext only.
 - **No account, no telemetry.**
 
-### Why not just use SSH? 
 
-For a machine you can already SSH into comfortably, `bitbang` has limited utility, unless you want access from outside your network, generic web proxying, or a browser as the client. For every other machine, the difference is setup and reach. SSH has to be enabled and configured before it will let you in. For example, it's disabled by default on Raspberry Pi OS, and it's often enabled with key-only access, meaning your public key has to get onto the machine first. And how do you do that? Email or a USB stick are usually the most painless options. `bitbang` can set up the connection with a 6-digit code exchange instead -- something you can do safely over the phone, or even call out across the room. SSH also needs an open port, and opening one to the outside world isn't straightforward. If you want to proxy a web app on the machine's network, SSH gives you a separate tunnel per app, named in advance. The `bitbang` proxy is generic: specify the web app's URL at connection time. In short, `bitbang` requires no root, no open port, and no config to grapple with -- and it offers simple pairing, access from outside your network, generic proxying, and a browser as the client.
+### Why not just use SSH?
+
+`bitbang` is shaped like ssh: `serve`, `connect`, and `cp` map to `sshd`, `ssh`, and `scp`, with WebRTC as the transport instead of TCP. For a machine you can already SSH into comfortably, that difference doesn't buy you much. But most of `bitbang` came out of annoyances I seem to hit more often than I should:
+
+**Reach.** Remote SSH access needs an inbound path, and on most networks opening one isn't your call -- CGNAT (cellular, Starlink, many ISPs), corporate, university, municipal. So in practice you bolt on a second system: Tailscale, a VPN, ngrok -- another install, another account, another daemon to keep running. `bitbang serve` needs no open port and works from anywhere.
+
+**Setup.** SSH has to be enabled and configured before it will let you in. It's disabled by default on Raspberry Pi OS, and often key-only, which means getting your public key onto the machine first. And how do you do that? Email or a USB stick are usually the most painless options. `bitbang` sets up the connection with a 6-digit code exchange instead -- something you can do safely over the phone, or call out across the room. It also runs as an ordinary user -- no root, no daemon, no config file.
+
+**Proxying.** If you want a web app on that machine's network, SSH gives you a separate tunnel per app, named in advance. The `bitbang` proxy is generic: specify the web app's URL at connection time.
+
+**Browser client.** SSH needs an SSH client and a key or password on the connecting side. `bitbang` needs a browser -- which means a phone, a borrowed laptop, or someone who has never opened a terminal. Hand them the URL and they get the access that you've granted them.
 
 ## Using `bitbang`
 
