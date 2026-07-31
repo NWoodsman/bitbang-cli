@@ -119,3 +119,71 @@ func TestIsLocalHost(t *testing.T) {
 		}
 	}
 }
+
+// Regression: an explicit scheme in the URL used to break the per-request
+// target. OnConnect stripped it correctly, but requests arrive carrying the
+// path as typed ("/https://localhost:8971/"), targetPrefix ("/localhost:8971")
+// did not match, and resolveTarget's "first segment with a colon is a host"
+// heuristic adopted "https:" as the hostname -- then CheckRedirect wrote that
+// into connTarget and poisoned every later request in the session.
+//
+// Observed live as:
+//
+//	Target updated: https: (from redirect)
+//	Get "https://https//localhost:8971/": lookup https: server misbehaving
+func TestResolveTarget_SchemeInRequestPath(t *testing.T) {
+	h := NewHTTPProxy("", "uid", "bitba.ng", "", false)
+	h.connTarget = "localhost:8971"
+	h.targetPrefix = "/localhost:8971"
+	h.connectPrefix = "/localhost:8971"
+
+	for _, in := range []string{
+		"/https://localhost:8971/",
+		"/http://localhost:8971/",
+		"/HTTPS://localhost:8971/",
+		"/https:/localhost:8971/",
+	} {
+		target, path := h.resolveTarget(in)
+		if target != "localhost:8971" {
+			t.Errorf("resolveTarget(%q) target = %q, want localhost:8971", in, target)
+		}
+		if path != "/" {
+			t.Errorf("resolveTarget(%q) path = %q, want /", in, path)
+		}
+		if h.connTarget != "localhost:8971" {
+			t.Fatalf("connTarget poisoned to %q by %q", h.connTarget, in)
+		}
+	}
+}
+
+func TestStripScheme(t *testing.T) {
+	cases := map[string]string{
+		"https://host:8971":     "host:8971",
+		"http://host:8971":      "host:8971",
+		"HTTPS://host:8971":     "host:8971",
+		"https:/host:8971":      "host:8971",
+		"https%3A%2F%2Fhost:80": "host:80",
+		"host:8971":             "host:8971", // untouched
+		"httpsomething/x":       "httpsomething/x",
+	}
+	for in, want := range cases {
+		if got := stripScheme(in); got != want {
+			t.Errorf("stripScheme(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestLooksLikeHostPort(t *testing.T) {
+	yes := []string{"host:8971", "192.0.2.1:80", "nas.local:5000"}
+	no := []string{"https:", "http:", "", "webpages", "cgi-bin"}
+	for _, s := range yes {
+		if !looksLikeHostPort(s) {
+			t.Errorf("looksLikeHostPort(%q) = false, want true", s)
+		}
+	}
+	for _, s := range no {
+		if looksLikeHostPort(s) {
+			t.Errorf("looksLikeHostPort(%q) = true, want false", s)
+		}
+	}
+}

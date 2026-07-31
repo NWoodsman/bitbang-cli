@@ -549,10 +549,15 @@ func (h *HTTPHandler) resolveTarget(requestPath string) (string, string) {
 		}
 		return h.connTarget, remainder
 	}
-	trimmed := strings.TrimPrefix(requestPath, "/")
+	// Strip any scheme the browser kept in the path. OnConnect already
+	// stripped it to derive connTarget, but requests arrive carrying the
+	// path the user actually typed -- so "/https://nas.local/" reaches here
+	// intact, targetPrefix ("/nas.local") does not match it, and the
+	// heuristic below would otherwise adopt "https:" as the hostname.
+	trimmed := stripScheme(strings.TrimPrefix(requestPath, "/"))
 	if slashIdx := strings.Index(trimmed, "/"); slashIdx > 0 {
 		firstSeg := trimmed[:slashIdx]
-		if strings.Contains(firstSeg, ":") {
+		if looksLikeHostPort(firstSeg) {
 			h.connTarget = firstSeg
 			h.targetPrefix = "/" + firstSeg
 			remainder := trimmed[slashIdx:]
@@ -561,7 +566,7 @@ func (h *HTTPHandler) resolveTarget(requestPath string) (string, string) {
 			}
 			return firstSeg, remainder
 		}
-	} else if strings.Contains(trimmed, ":") {
+	} else if looksLikeHostPort(trimmed) {
 		h.connTarget = trimmed
 		h.targetPrefix = "/" + trimmed
 		if h.Verbose {
@@ -579,12 +584,54 @@ func (h *HTTPHandler) resolveTarget(requestPath string) (string, string) {
 	return h.connTarget, requestPath
 }
 
+// stripScheme removes a leading http/https scheme from a target string.
+//
+// Tolerant on purpose: this string crosses browser fragment parsing,
+// bootstrap.js, the service worker's path construction, and Go's URL
+// handling, and each can reshape it. Observed and plausible manglings:
+//
+//	https://host:8971      as typed
+//	https:/host:8971       "//" collapsed by a URL normaliser
+//	HTTPS://host:8971      case varies
+//	https%3A%2F%2Fhost     ":" and "/" percent-encoded
+//
+// Only the scheme prefix is decoded -- never the whole path, where %20 and
+// friends are legitimate and decoding them would corrupt the request.
+func stripScheme(s string) string {
+	for _, scheme := range []string{"https", "http"} { // longest first
+		for _, sep := range []string{"://", ":/", "%3A%2F%2F", "%3a%2f%2f", "%3A%2F", "%3a%2f"} {
+			p := scheme + sep
+			if len(s) > len(p) && strings.EqualFold(s[:len(p)], p) {
+				return s[len(p):]
+			}
+		}
+	}
+	return s
+}
+
+// looksLikeHostPort reports whether a path segment can plausibly be a
+// "host" or "host:port" target.
+//
+// Replaces a bare strings.Contains(seg, ":") test, which accepted "https:"
+// as a hostname: with a scheme left in the path, the proxy adopted "https:"
+// as the target, dialled it, and poisoned connTarget for the rest of the
+// session. A colon alone is not evidence of a host.
+// Deliberately a minimal change from the original strings.Contains(seg, ":")
+// test: same answer for every segment except one that ENDS in a colon, which
+// is a scheme remnant ("https:") rather than a host. Broadening it further
+// would reclassify ordinary path segments as targets -- "webpages",
+// "cgi-bin" and friends must keep resolving as paths.
+func looksLikeHostPort(seg string) bool {
+	if seg == "" || strings.HasSuffix(seg, ":") {
+		return false
+	}
+	return strings.Contains(seg, ":")
+}
+
 // parseTargetFromPath extracts a host:port target from the first segment
 // of the connect path. Returns (target, remainingPath).
 func parseTargetFromPath(path string) (string, string) {
-	trimmed := strings.TrimPrefix(path, "/")
-	trimmed = strings.TrimPrefix(trimmed, "http://")
-	trimmed = strings.TrimPrefix(trimmed, "https://")
+	trimmed := stripScheme(strings.TrimSpace(strings.TrimPrefix(path, "/")))
 	if trimmed == "" {
 		return "", "/"
 	}
