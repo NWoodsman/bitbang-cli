@@ -31,6 +31,7 @@ package localdns
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"net"
@@ -210,6 +211,9 @@ func queryMDNS(ctx context.Context, host string) (netip.Addr, time.Duration, err
 var (
 	transportOnce sync.Once
 	transport     *http.Transport
+
+	insecureOnce      sync.Once
+	insecureTransport *http.Transport
 )
 
 // Transport returns a process-wide http.Transport that resolves ".local"
@@ -220,14 +224,65 @@ var (
 // giving each one its own Transport would discard the connection pool.
 func Transport() *http.Transport {
 	transportOnce.Do(func() {
-		base, ok := http.DefaultTransport.(*http.Transport)
-		if !ok {
-			transport = &http.Transport{DialContext: Default.DialContext}
-			return
-		}
-		t := base.Clone()
-		t.DialContext = Default.DialContext
-		transport = t
+		transport = newTransport()
 	})
 	return transport
+}
+
+// InsecureTransport is Transport with certificate verification disabled.
+//
+// For HTTPS targets on the local network only -- see streamtype.isLocalHost.
+// Home devices (NAS boxes, printers, Frigate, OctoPrint) universally serve
+// self-signed certificates, so verification cannot succeed and refusing to
+// connect buys nothing: the leg being protected is one hop, on a LAN the
+// user deliberately reached into, and the internet hop is already covered
+// by bitbang's own DTLS. Encryption without authentication still defeats
+// passive eavesdropping; it does not defeat an active on-path attacker.
+//
+// A SEPARATE singleton rather than mutating Transport's TLS config: public
+// targets must keep verifying, and a shared mutable config would silently
+// disable that for every session in the process. Two pools instead of one
+// is the price; correctness is worth more than pool sharing here.
+func InsecureTransport() *http.Transport {
+	insecureOnce.Do(func() {
+		t := newTransport()
+		if t.TLSClientConfig == nil {
+			t.TLSClientConfig = &tls.Config{}
+		} else {
+			t.TLSClientConfig = t.TLSClientConfig.Clone()
+		}
+		t.TLSClientConfig.InsecureSkipVerify = true
+		insecureTransport = t
+	})
+	return insecureTransport
+}
+
+func newTransport() *http.Transport {
+	base, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		return &http.Transport{DialContext: Default.DialContext}
+	}
+	t := base.Clone()
+	t.DialContext = Default.DialContext
+	return t
+}
+
+// ProbeTLS reports whether host (a "host:port" target) answers a TLS
+// handshake. Verification is skipped: the question is only "does this
+// speak TLS", and a self-signed answer is still a yes.
+//
+// Used as a fallback after a plaintext probe fails, so the common case
+// (plaintext) never pays for it.
+func ProbeTLS(ctx context.Context, hostPort string, timeout time.Duration) bool {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	// Dial through the same mDNS-aware resolver so ".local" HTTPS targets
+	// are probed correctly rather than failing name resolution.
+	rawConn, err := Default.DialContext(ctx, "tcp", hostPort)
+	if err != nil {
+		return false
+	}
+	tlsConn := tls.Client(rawConn, &tls.Config{InsecureSkipVerify: true})
+	defer tlsConn.Close()
+	return tlsConn.HandshakeContext(ctx) == nil
 }

@@ -1,6 +1,7 @@
 package streamtype
 
 import (
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -19,6 +20,22 @@ var wsDialer = &websocket.Dialer{
 	Proxy:            websocket.DefaultDialer.Proxy,
 	HandshakeTimeout: websocket.DefaultDialer.HandshakeTimeout,
 	NetDialContext:   localdns.Default.DialContext,
+}
+
+// wss:// variants. Split so the trust decision mirrors the HTTP side
+// exactly: local targets skip verification (home devices self-sign),
+// public ones verify normally.
+var wsDialerSecure = &websocket.Dialer{
+	Proxy:            websocket.DefaultDialer.Proxy,
+	HandshakeTimeout: websocket.DefaultDialer.HandshakeTimeout,
+	NetDialContext:   localdns.Default.DialContext,
+}
+
+var wsDialerInsecure = &websocket.Dialer{
+	Proxy:            websocket.DefaultDialer.Proxy,
+	HandshakeTimeout: websocket.DefaultDialer.HandshakeTimeout,
+	NetDialContext:   localdns.Default.DialContext,
+	TLSClientConfig:  &tls.Config{InsecureSkipVerify: true},
 }
 
 // WSHandler implements StreamHandler for type="websocket". Bridges a SWSP
@@ -113,7 +130,20 @@ func (h *WSHandler) OnFIN(s Stream, _ []byte) error {
 
 func (h *WSHandler) bridge(s Stream, pathname, cookies string) {
 	target, wsPath := h.Resolver.ResolveTarget(pathname)
-	wsURL := fmt.Sprintf("ws://%s%s", target, wsPath)
+
+	// An HTTPS session must dial wss://, or the handshake hits a TLS port
+	// in plaintext and fails. The scheme and the trust decision both come
+	// from the paired HTTPHandler via optional interfaces, so other
+	// TargetResolver implementations stay unaffected.
+	scheme, dialer := "ws", wsDialer
+	if sp, ok := h.Resolver.(interface{ Scheme() string }); ok && sp.Scheme() == "https" {
+		scheme = "wss"
+		dialer = wsDialerSecure
+		if sv, ok := h.Resolver.(interface{ SkipVerify() bool }); ok && sv.SkipVerify() {
+			dialer = wsDialerInsecure
+		}
+	}
+	wsURL := fmt.Sprintf("%s://%s%s", scheme, target, wsPath)
 	header := http.Header{}
 	if cookies != "" {
 		header.Set("Cookie", cookies)
@@ -123,7 +153,7 @@ func (h *WSHandler) bridge(s Stream, pathname, cookies string) {
 	if ip := net.ParseIP(h.BrowserIP); ip != nil {
 		header.Set("X-Forwarded-For", ip.String())
 	}
-	conn, _, err := wsDialer.Dial(wsURL, header)
+	conn, _, err := dialer.Dial(wsURL, header)
 	if err != nil {
 		log.Printf("WS connect failed: %s -> %v", pathname, err)
 		_ = s.WriteFIN(nil)

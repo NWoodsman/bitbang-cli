@@ -2,6 +2,7 @@ package streamtype
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -48,6 +49,9 @@ type HTTPHandler struct {
 	connTarget    string
 	targetPrefix  string
 	connectPrefix string
+	// connScheme is "http" or "https", resolved once per session in
+	// OnConnect and reused for every request and WebSocket on it.
+	connScheme string
 
 	// Per-stream state.
 	mu      sync.Mutex
@@ -107,9 +111,14 @@ func (h *HTTPHandler) OnConnect(path string) error {
 		}
 	}
 
-	// Probe to resolve cross-host redirects and detect HTTPS-only targets.
+	// Resolve cross-host redirects and settle on a scheme for the session.
+	//
+	// Plaintext is probed FIRST because it is the common case: an HTTPS-only
+	// target then pays one failed HTTP probe, rather than every plaintext
+	// target paying a failed TLS handshake.
 	if h.connTarget != "" {
-		requiresHTTPS := false
+		h.connScheme = "http"
+		sawHTTPSRedirect := false
 		probeURL := fmt.Sprintf("http://%s/", h.connTarget)
 		probeClient := &http.Client{
 			// mDNS-aware: a CGO_ENABLED=0 build cannot resolve .local
@@ -117,7 +126,7 @@ func (h *HTTPHandler) OnConnect(path string) error {
 			Transport: localdns.Transport(),
 			CheckRedirect: func(r *http.Request, via []*http.Request) error {
 				if r.URL.Scheme == "https" {
-					requiresHTTPS = true
+					sawHTTPSRedirect = true
 				}
 				if r.URL.Host != "" && r.URL.Host != h.connTarget {
 					h.connTarget = r.URL.Host
@@ -130,14 +139,130 @@ func (h *HTTPHandler) OnConnect(path string) error {
 			},
 		}
 		probeReq, _ := http.NewRequest("HEAD", probeURL, nil)
-		if probeResp, err := probeClient.Do(probeReq); err == nil {
+		probeResp, probeErr := probeClient.Do(probeReq)
+		if probeResp != nil {
 			probeResp.Body.Close()
 		}
-		if requiresHTTPS {
-			return fmt.Errorf("%s requires HTTPS, which is not currently supported", h.connTarget)
+
+		plaintextOK := probeErr == nil && probeResp != nil && probeResp.StatusCode < 400
+
+		switch {
+		case sawHTTPSRedirect:
+			// Target redirects http -> https. Follow it rather than refusing.
+			h.connScheme = "https"
+
+		case plaintextOK:
+			// Clean plaintext answer; nothing more to do.
+
+		default:
+			// Either the probe errored, or it "succeeded" with a 4xx/5xx.
+			//
+			// The error-only test is NOT sufficient: a TLS port does not
+			// usually refuse a plaintext request. Go's TLS server and nginx
+			// (which Frigate runs) both reply with a perfectly readable
+			// HTTP 400 -- "The plain HTTP request was sent to HTTPS port".
+			// Treating that as success is what left HTTPS targets silently
+			// broken, so any non-2xx/3xx is worth a TLS probe.
+			//
+			// A plaintext server that genuinely answers 4xx at "/" (auth
+			// required, say) just pays one failed handshake on a LAN and
+			// stays on http.
+			switch {
+			case localdns.ProbeTLS(context.Background(), h.connTarget, probeTimeout):
+				h.connScheme = "https"
+			case probeErr != nil:
+				// No HTTP response and no TLS handshake: nothing is there.
+				// Previously this was swallowed and surfaced later as a 502
+				// on every request with no hint as to why.
+				return fmt.Errorf("%s is unreachable (no HTTP or HTTPS response)", h.connTarget)
+			}
+			// Otherwise: reachable over plaintext, just an error status at
+			// "/" -- stay on http.
+		}
+
+		if h.Verbose {
+			log.Printf("Connect: scheme=%s target=%s%s", h.connScheme, h.connTarget,
+				map[bool]string{true: " (cert verification skipped: local target)", false: ""}[h.skipVerify()])
 		}
 	}
 	return nil
+}
+
+// probeTimeout bounds the TLS fallback probe. LAN-local, so this is a
+// ceiling for a hung target rather than a realistic latency budget --
+// without it, a server that accepts the connection and never replies
+// would stall the whole session setup.
+const probeTimeout = 3 * time.Second
+
+// scheme returns the resolved session scheme, defaulting to http for
+// sessions that never ran the probe (fixed-target tests, landing page).
+func (h *HTTPHandler) scheme() string {
+	if h.connScheme == "" {
+		return "http"
+	}
+	return h.connScheme
+}
+
+// Scheme implements the optional interface WSHandler type-asserts for, so
+// a WebSocket on an HTTPS session dials wss:// rather than ws://.
+func (h *HTTPHandler) Scheme() string { return h.scheme() }
+
+// SkipVerify reports whether TLS certificate verification should be
+// skipped for this session's target. Exposed for WSHandler, which needs
+// the same trust decision for its own dialer.
+func (h *HTTPHandler) SkipVerify() bool { return h.skipVerify() }
+
+func (h *HTTPHandler) skipVerify() bool {
+	return h.scheme() == "https" && isLocalHost(h.connTarget)
+}
+
+// httpClient returns a client for this session, with the transport chosen
+// by the trust decision: local HTTPS targets skip verification, everything
+// else verifies normally.
+func (h *HTTPHandler) transport() *http.Transport {
+	if h.skipVerify() {
+		return localdns.InsecureTransport()
+	}
+	return localdns.Transport()
+}
+
+// isLocalHost reports whether a "host[:port]" target is on the local
+// network: loopback, RFC1918, CGNAT, link-local, or an mDNS ".local" name.
+//
+// Only these skip certificate verification. A PUBLIC host failing
+// verification is genuinely suspicious and still errors -- the exemption
+// exists because home devices universally self-sign, not because
+// certificates are inconvenient.
+func isLocalHost(target string) bool {
+	host := target
+	if h, _, err := net.SplitHostPort(target); err == nil {
+		host = h
+	}
+	host = strings.Trim(host, "[]")
+	if host == "" {
+		return false
+	}
+	lower := strings.ToLower(host)
+	if lower == "localhost" || strings.HasSuffix(lower, ".localhost") {
+		return true
+	}
+	if localdns.IsLocalName(host) {
+		return true
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		// A bare hostname with no dots is a LAN name in practice
+		// ("nas", "octopi"); anything dotted is treated as public.
+		return !strings.Contains(host, ".")
+	}
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() {
+		return true
+	}
+	// 100.64.0.0/10 -- CGNAT, used by Tailscale and similar overlays.
+	if ip4 := ip.To4(); ip4 != nil && ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127 {
+		return true
+	}
+	return false
 }
 
 // OnSYN handles the start of a new HTTP stream — parses the request, kicks
@@ -207,7 +332,7 @@ func (h *HTTPHandler) proxyRequest(s Stream, req protocol.Request, body io.Reade
 	}
 
 	target, pathname := h.resolveTarget(req.Pathname)
-	url := fmt.Sprintf("http://%s%s", target, pathname)
+	url := fmt.Sprintf("%s://%s%s", h.scheme(), target, pathname)
 
 	// Buffer the body so Content-Length is explicit (many embedded
 	// servers don't support chunked encoding).
@@ -271,12 +396,13 @@ func (h *HTTPHandler) proxyRequest(s Stream, req protocol.Request, body io.Reade
 	} else {
 		httpReq.Header.Del("X-Forwarded-For")
 	}
-	httpReq.Header.Set("Referer", fmt.Sprintf("http://%s/", target))
+	httpReq.Header.Set("Referer", fmt.Sprintf("%s://%s/", h.scheme(), target))
 
 	client := &http.Client{
 		// Shared mDNS-aware transport -- also preserves the connection pool
-		// across these per-request clients.
-		Transport: localdns.Transport(),
+		// across these per-request clients. Picks the verifying or
+		// non-verifying variant per the session's trust decision.
+		Transport: h.transport(),
 		CheckRedirect: func(r *http.Request, via []*http.Request) error {
 			if r.URL.Host != "" && r.URL.Host != target {
 				h.connTarget = r.URL.Host
