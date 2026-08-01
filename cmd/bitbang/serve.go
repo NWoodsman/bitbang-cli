@@ -112,8 +112,8 @@ func runServe(args []string) {
 	startListener(cfg)
 }
 
-// runServeShell — `bitbang serve shell` — exposes shell only. No
-// hamburger; the entire tab is the shell.
+// runServeShell — `bitbang serve shell` — exposes shell and raw TCP to CLI
+// connectors. No hamburger; the entire browser tab is the shell.
 func runServeShell(args []string) {
 	fs := flag.NewFlagSet("serve shell", flag.ExitOnError)
 	cfg := serveConfig{shellEnabled: true}
@@ -485,6 +485,7 @@ func startListener(cfg serveConfig) {
 				handlers = append(handlers, streamtype.NewFile(share, cfg.verbose))
 			}
 			var shellHandler *streamtype.ShellHandler
+			var tcpHandler *streamtype.TCPHandler
 			if cfg.shellEnabled {
 				shellHandler = streamtype.NewShell(shellArgv, cfg.verbose)
 				shellHandler.MaxConcurrent = cfg.shellMaxSessions
@@ -493,6 +494,8 @@ func startListener(cfg serveConfig) {
 					shellHandler.StderrMirror = os.Stderr
 				}
 				handlers = append(handlers, shellHandler)
+				tcpHandler = streamtype.NewTCP(cfg.verbose)
+				handlers = append(handlers, tcpHandler)
 			}
 			// Fixed-target proxy-only mode (e.g. the OctoPrint plugin): every
 			// request goes straight to --target, so the plain device URL serves
@@ -555,6 +558,9 @@ func startListener(cfg serveConfig) {
 			// browser tab and keep holding their max-sessions slot.
 			if shellHandler != nil {
 				onClose = append(onClose, shellHandler.KillAll)
+			}
+			if tcpHandler != nil {
+				onClose = append(onClose, tcpHandler.CloseAll)
 			}
 			// Tear down the video PC and unregister the bridge.
 			if videoClient != nil {
@@ -700,6 +706,7 @@ func printSharingBlock(cfg serveConfig, share *fileshare.FileShare) {
 		}
 		shellLine += ")"
 		fmt.Println(shellLine)
+		fmt.Println("  • tcp    (targets chosen by connect -L; loopback-bound on the connector by default)")
 	}
 	if cfg.filesEnabled && share != nil {
 		if share.Mode == fileshare.ModeSend {

@@ -256,6 +256,19 @@ func startListener(host string, id *identity.Identity, handlers ...streamtype.St
 			conn = c
 			sess = session.New(c.DC, auth.New(""), false, handlers...)
 			mu.Unlock()
+			var closeHandlers []func()
+			for _, handler := range handlers {
+				if closer, ok := handler.(interface{ CloseAll() }); ok {
+					closeHandlers = append(closeHandlers, closer.CloseAll)
+				}
+			}
+			if len(closeHandlers) > 0 {
+				c.OnClose = func() {
+					for _, closeHandler := range closeHandlers {
+						closeHandler()
+					}
+				}
+			}
 		case "answer":
 			sdp, _ := msg["sdp"].(string)
 			enc, _ := msg["encrypted_request"].(string)

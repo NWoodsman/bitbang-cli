@@ -1,11 +1,16 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
+	"io"
+	"net"
+	"net/netip"
 	"net/url"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -14,7 +19,117 @@ import (
 	"golang.org/x/term"
 
 	"github.com/richlegrand/bitbang/internal/client"
+	"github.com/richlegrand/bitbang/internal/tcpforward"
 )
+
+type connectOptions struct {
+	verbose  bool
+	timeout  time.Duration
+	pin      string
+	server   string
+	name     string
+	relay    bool
+	gateway  bool
+	forwards forwardFlags
+	target   string
+	argv     []string
+}
+
+type forwardFlags []tcpforward.Forward
+
+func (f *forwardFlags) String() string {
+	parts := make([]string, len(*f))
+	for i, forward := range *f {
+		parts[i] = forward.String()
+	}
+	return strings.Join(parts, ",")
+}
+
+func (f *forwardFlags) Set(value string) error {
+	forward, err := parseLocalForward(value)
+	if err != nil {
+		return err
+	}
+	*f = append(*f, forward)
+	return nil
+}
+
+func parseLocalForward(value string) (tcpforward.Forward, error) {
+	localEnd := strings.IndexByte(value, ':')
+	if localEnd <= 0 || localEnd == len(value)-1 {
+		return tcpforward.Forward{}, fmt.Errorf("want LOCAL_PORT:REMOTE_HOST:REMOTE_PORT")
+	}
+	localPort, err := parseForwardPort(value[:localEnd])
+	if err != nil {
+		return tcpforward.Forward{}, fmt.Errorf("local port: %w", err)
+	}
+	remoteTarget := value[localEnd+1:]
+	host, remotePortText, err := net.SplitHostPort(remoteTarget)
+	if err != nil {
+		return tcpforward.Forward{}, fmt.Errorf("remote target: %w", err)
+	}
+	if strings.HasPrefix(remoteTarget, "[") {
+		if ip, err := netip.ParseAddr(host); err != nil || !ip.Is6() {
+			return tcpforward.Forward{}, fmt.Errorf("remote target: invalid bracketed IPv6 address %q", host)
+		}
+	}
+	remotePort, err := parseForwardPort(remotePortText)
+	if err != nil {
+		return tcpforward.Forward{}, fmt.Errorf("remote port: %w", err)
+	}
+	if err := tcpforward.ValidateTarget(host, remotePort); err != nil {
+		return tcpforward.Forward{}, err
+	}
+	return tcpforward.Forward{LocalPort: localPort, Host: host, Port: remotePort}, nil
+}
+
+func parseForwardPort(value string) (int, error) {
+	if value == "" {
+		return 0, fmt.Errorf("port is empty")
+	}
+	for _, r := range value {
+		if r < '0' || r > '9' {
+			return 0, fmt.Errorf("%q is not a decimal port", value)
+		}
+	}
+	port, err := strconv.Atoi(value)
+	if err != nil || port < 1 || port > 65535 {
+		return 0, fmt.Errorf("%q is outside 1-65535", value)
+	}
+	return port, nil
+}
+
+func parseConnectOptions(args []string, output io.Writer) (connectOptions, error) {
+	var opts connectOptions
+	fs := flag.NewFlagSet("connect", flag.ContinueOnError)
+	fs.SetOutput(output)
+	fs.BoolVar(&opts.verbose, "v", false, "Verbose logging")
+	fs.DurationVar(&opts.timeout, "timeout", 30*time.Second, "Dial timeout")
+	fs.StringVar(&opts.pin, "pin", "", "PIN (skips the interactive prompt)")
+	fs.StringVar(&opts.server, "server", "bitba.ng", "Signaling server (pair-code mode only; URL form carries its own server)")
+	fs.StringVar(&opts.name, "name", "", "Name to remember this device under (new devices only; auto-assigned if omitted)")
+	fs.BoolVar(&opts.relay, "relay", false, "Request a TURN relay up front instead of only on fallback (ICE still prefers direct if it succeeds)")
+	fs.Var(&opts.forwards, "L", "Forward LOCAL_PORT:REMOTE_HOST:REMOTE_PORT (repeatable; bracket IPv6 hosts)")
+	fs.BoolVar(&opts.gateway, "g", false, "Bind forwarded ports on 0.0.0.0 instead of 127.0.0.1")
+	if err := fs.Parse(reorderArgs(fs, args)); err != nil {
+		return connectOptions{}, err
+	}
+	if opts.gateway && len(opts.forwards) == 0 {
+		return connectOptions{}, fmt.Errorf("-g requires at least one -L forward")
+	}
+	posArgs := fs.Args()
+	if len(posArgs) < 1 {
+		return connectOptions{}, fmt.Errorf("missing URL, saved name, or pair code")
+	}
+	opts.target = posArgs[0]
+	for i, arg := range posArgs[1:] {
+		if arg == "--" {
+			opts.argv = posArgs[2+i:]
+			break
+		}
+	}
+	return opts, nil
+}
 
 // runConnect implements `bitbang connect <name-or-URL-or-pair-code> [-- argv...]`.
 //
@@ -47,42 +162,27 @@ import (
 //	bitba.ng/<UID>#<CODE>
 //	<UID>#<CODE>                  (defaults to bitba.ng)
 func runConnect(args []string) {
-	fs := flag.NewFlagSet("connect", flag.ExitOnError)
-	verbose := fs.Bool("v", false, "Verbose logging")
-	timeout := fs.Duration("timeout", 30*time.Second, "Dial timeout")
-	pin := fs.String("pin", "", "PIN (skips the interactive prompt)")
-	server := fs.String("server", "bitba.ng", "Signaling server (pair-code mode only; URL form carries its own server)")
-	name := fs.String("name", "", "Name to remember this device under (new devices only; auto-assigned if omitted)")
-	relay := fs.Bool("relay", false, "Request a TURN relay up front instead of only on fallback (ICE still prefers direct if it succeeds)")
-	fs.Parse(reorderArgs(fs, args))
-
-	posArgs := fs.Args()
-	if len(posArgs) < 1 {
-		fmt.Fprintln(os.Stderr, "Usage: bitbang connect <URL-or-pair-code> [-- argv...]")
+	opts, err := parseConnectOptions(args, os.Stderr)
+	if errors.Is(err, flag.ErrHelp) {
+		return
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "bitbang connect: %v\n", err)
+		fmt.Fprintln(os.Stderr, "Usage: bitbang connect <URL-or-pair-code> [-L port:host:port ...] [-g] [-- argv...]")
 		os.Exit(2)
 	}
-	urlArg := posArgs[0]
-
-	// Split off the optional `-- argv...` block. The `--` literal marks
-	// the boundary between bitbang flags + URL and the remote command.
-	var argv []string
-	for i, a := range posArgs[1:] {
-		if a == "--" {
-			argv = posArgs[2+i:]
-			break
-		}
-	}
+	urlArg := opts.target
 
 	// Validate -name up front so a bad or already-taken name fails fast,
 	// before any pairing or dialing. The authoritative checks live in
 	// recordDevice (it knows the UID), but catching the common mistakes here
 	// spares the operator a pointless handshake.
-	if *name != "" {
-		if err := validateDeviceName(*name); err != nil {
+	if opts.name != "" {
+		if err := validateDeviceName(opts.name); err != nil {
 			fail("connect: %v", err)
 		}
-		if _, taken := lookupDeviceByName(*name); taken {
-			fail("connect: name %q is already used by another device", *name)
+		if _, taken := lookupDeviceByName(opts.name); taken {
+			fail("connect: name %q is already used by another device", opts.name)
 		}
 	}
 
@@ -106,17 +206,17 @@ func runConnect(args []string) {
 		if !ok {
 			fail("connect: no saved device named %q (expected a saved name, a 6-digit pair code, or a URL)", urlArg)
 		}
-		if *name != "" {
+		if opts.name != "" {
 			fail("connect: %q is already a saved device; renaming via connect isn't supported", urlArg)
 		}
 		rs = remoteSpec{Server: ent.Server, UID: ent.UID, Code: ent.AccessCode}
 		saved = true
 	case pairCodePattern.MatchString(urlArg):
-		rs = runPairConnect(urlArg, *server, *verbose, *relay)
+		rs = runPairConnect(urlArg, opts.server, opts.verbose, opts.relay)
 		// Pairing succeeded (runPairConnect exits on failure). Persist now,
 		// before the reconnect dial — the pairing itself was the expensive,
 		// one-shot step, so a reconnect hiccup shouldn't discard the result.
-		recordAndReport(rs, *name)
+		recordAndReport(rs, opts.name)
 		saved = true
 	default:
 		var ok bool
@@ -130,21 +230,34 @@ func runConnect(args []string) {
 	// was supplied. With argv, the user wants a one-shot command run
 	// non-interactively (suitable for scripting / piping).
 	stdinIsTTY := term.IsTerminal(int(os.Stdin.Fd()))
-	interactive := stdinIsTTY && len(argv) == 0
+	interactive := stdinIsTTY && len(opts.argv) == 0
 
 	fmt.Fprintf(os.Stderr, "Connecting to %s...\n", rs.Server)
-	sess := dialConnect(rs, *verbose, *timeout, *pin, *relay)
-	defer sess.Close()
+	sess := dialConnect(rs, opts.verbose, opts.timeout, opts.pin, opts.relay, len(opts.forwards) > 0)
+	var forwarder *client.LocalForwarder
+	if len(opts.forwards) > 0 {
+		forwarder, err = sess.StartLocalForwarding([]tcpforward.Forward(opts.forwards), opts.gateway)
+		if err != nil {
+			sess.Close()
+			fail("connect: %v", err)
+		}
+		if opts.gateway {
+			fmt.Fprintln(os.Stderr, "Warning: -g makes forwarded ports reachable from the local network.")
+		}
+		for _, forward := range opts.forwards {
+			fmt.Fprintf(os.Stderr, "Forwarding %s -> %s\n", forward.BindAddress(opts.gateway), forward.TargetAddress())
+		}
+	}
 	fmt.Fprintln(os.Stderr, "Connected.")
 
 	// URL-flow hosts are remembered once we've actually connected. Pair and
 	// name-resolved hosts are already saved (see above).
 	if !saved {
-		recordAndReport(rs, *name)
+		recordAndReport(rs, opts.name)
 	}
 
-	opts := client.ShellOptions{
-		Argv:   argv,
+	shellOpts := client.ShellOptions{
+		Argv:   opts.argv,
 		PTY:    interactive,
 		Stdin:  os.Stdin,
 		Stdout: os.Stdout,
@@ -158,13 +271,17 @@ func runConnect(args []string) {
 	// before each os.Exit (sync.Once inside makes double-calls safe).
 	restore := func() {}
 	if interactive {
-		restore = setupInteractive(&opts)
+		restore = setupInteractive(&shellOpts)
 	} else {
-		setupNonInteractive(&opts)
+		setupNonInteractive(&shellOpts)
 	}
 
-	result, err := sess.Shell(opts)
+	result, err := sess.Shell(shellOpts)
 	restore() // BEFORE any os.Exit, including via fail().
+	if forwarder != nil {
+		forwarder.Close()
+	}
+	sess.Close()
 	if err != nil {
 		fail("connect: %v", err)
 	}
@@ -287,12 +404,16 @@ func recordAndReport(rs remoteSpec, name string) {
 
 // dialConnect handles the boilerplate: build DialOptions, run the
 // handshake, sanity-check that the listener advertises "shell."
-func dialConnect(r remoteSpec, verbose bool, timeout time.Duration, suppliedPIN string, relay bool) *client.Session {
+func dialConnect(r remoteSpec, verbose bool, timeout time.Duration, suppliedPIN string, relay, tcp bool) *client.Session {
+	caps := []string{"shell"}
+	if tcp {
+		caps = append(caps, "tcp")
+	}
 	opts := client.DialOptions{
 		Server:      r.Server,
 		UID:         r.UID,
 		Code:        r.Code,
-		Caps:        []string{"shell"},
+		Caps:        caps,
 		DialTimeout: timeout,
 		ForceRelay:  relay,
 		Verbose:     verbose,
@@ -305,6 +426,10 @@ func dialConnect(r remoteSpec, verbose bool, timeout time.Duration, suppliedPIN 
 	if !hasCap(sess.ServerCaps, "shell") {
 		sess.Close()
 		fail("connect: listener does not advertise the `shell` capability (caps: %v)", sess.ServerCaps)
+	}
+	if tcp && !hasCap(sess.ServerCaps, "tcp") {
+		sess.Close()
+		fail("connect: listener does not advertise the `tcp` capability (caps: %v)", sess.ServerCaps)
 	}
 	return sess
 }

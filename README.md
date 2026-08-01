@@ -77,6 +77,8 @@ Open the URL. Depending on what's served, you get:
 ```
 bitbang connect <url>                                   # interactive shell
 bitbang connect <url> -- tail -f /var/log/syslog        # one-shot command
+bitbang connect <url> -L 15432:db.internal:5432         # local TCP forwarding
+bitbang connect <url> -L 14450:nas.local:445 -L 15900:[fd00::20]:5900
 bitbang cp <url>:/var/log/app.log ./app.log             # copy files, scp-style
 bitbang cp - <url>:/tmp/firmware.bin < firmware.bin     # stdin/stdout work too
 ```
@@ -188,14 +190,16 @@ bitbang help                           Usage (also --help, -h)
 
 With no `-- command`, opens an interactive shell (a PTY when stdin is a terminal). With `-- command args…`, runs that single command non-interactively and exits with its status (signal exits report 128).
 
-| Flag           | Default    | Description                                                                                                 |
-| -------------- | ---------- | ----------------------------------------------------------------------------------------------------------- |
-| `-name NAME`   | (auto)     | Remember this host under NAME (new hosts only; auto-assigns `device<N>` if omitted)                         |
-| `-relay`       | off        | Request a TURN relay up front instead of only on fallback (ICE still prefers a direct path if one succeeds) |
-| `-pin PIN`     | (prompt)   | PIN to send if the listener requires one (skips the interactive prompt)                                     |
-| `-timeout DUR` | `30s`      | Dial timeout (e.g. `45s`, `1m`)                                                                             |
-| `-server HOST` | `bitba.ng` | Signaling server -- **pair-code mode only**; the URL form carries its own host                              |
-| `-v`           | off        | Verbose logging                                                                                             |
+| Flag                                    | Default    | Description                                                                                                 |
+| --------------------------------------- | ---------- | ----------------------------------------------------------------------------------------------------------- |
+| `-L LOCAL_PORT:REMOTE_HOST:REMOTE_PORT` | (none)     | Forward `LOCAL_PORT` to `REMOTE_HOST:REMOTE_PORT` (repeatable; bracket IPv6 hosts)                           |
+| `-g`                                    | off        | Bind forwarded ports on `0.0.0.0` instead of `127.0.0.1`                                                   |
+| `-name NAME`                            | (auto)     | Remember this host under NAME (new hosts only; auto-assigns `device<N>` if omitted)                         |
+| `-relay`                                | off        | Request a TURN relay up front instead of only on fallback (ICE still prefers a direct path if one succeeds) |
+| `-pin PIN`                              | (prompt)   | PIN to send if the listener requires one (skips the interactive prompt)                                     |
+| `-timeout DUR`                          | `30s`      | Dial timeout (e.g. `45s`, `1m`)                                                                             |
+| `-server HOST`                          | `bitba.ng` | Signaling server -- **pair-code mode only**; the URL form carries its own host                              |
+| `-v`                                    | off        | Verbose logging                                                                                             |
 
 ### `bitbang cp <src> <dst>` -- copy files
 
