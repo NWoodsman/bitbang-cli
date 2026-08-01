@@ -9,9 +9,9 @@ require (
 	github.com/pion/turn/v4 v4.1.4
 	github.com/pion/webrtc/v4 v4.2.12
 	github.com/skip2/go-qrcode v0.0.0-20200617195104-da1b6568686e
-	golang.org/x/net v0.53.0
-	golang.org/x/sys v0.44.0
-	golang.org/x/term v0.43.0
+	golang.org/x/net v0.57.0
+	golang.org/x/sys v0.47.0
+	golang.org/x/term v0.45.0
 )
 
 require (
@@ -33,6 +33,6 @@ require (
 	github.com/pion/turn/v5 v5.0.3 // indirect
 	github.com/u-root/u-root v0.16.0 // indirect
 	github.com/wlynxg/anet v0.0.5 // indirect
-	golang.org/x/crypto v0.51.0 // indirect
+	golang.org/x/crypto v0.54.0 // indirect
 	golang.org/x/time v0.14.0 // indirect
 )
