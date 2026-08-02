@@ -36,7 +36,7 @@ func TestWindowsSignalMapping(t *testing.T) {
 }
 
 func TestWindowsPTYEnabled(t *testing.T) {
-	if !usePTY(true) {
-		t.Fatal("Windows should honor a browser PTY request with ConPTY")
+	if !platformSupportsPTY {
+		t.Fatal("Windows should advertise ConPTY support")
 	}
 }

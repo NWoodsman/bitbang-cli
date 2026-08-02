@@ -4,8 +4,8 @@ package streamtype
 
 import (
 	"os"
-	"sync"
 	"syscall"
+	"time"
 
 	ptylib "github.com/aymanbagabas/go-pty"
 )
@@ -17,15 +17,21 @@ func defaultShellArgv() []string {
 	return []string{"/bin/sh"}
 }
 
-func usePTY(requested bool) bool { return requested }
+const platformSupportsPTY = true
 
 func terminateShellProcess(process *os.Process) error {
 	return process.Signal(syscall.SIGHUP)
 }
 
-func finishPTY(terminal ptylib.Pty, output *sync.WaitGroup) {
-	output.Wait()
+func finishPTY(terminal ptylib.Pty, output *shellOutput, timeout time.Duration) bool {
+	if output.wait(timeout) {
+		_ = terminal.Close()
+		return true
+	}
+	output.cancel()
 	_ = terminal.Close()
+	_ = output.wait(shellOutputCloseGrace)
+	return false
 }
 
 func signalFromName(name string) os.Signal {

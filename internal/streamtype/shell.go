@@ -40,6 +40,66 @@ const (
 // across all of them.
 var activeShellCount atomic.Int32
 
+const (
+	maxShellBuffered        uint64 = 8 << 20
+	shellOutputDrainTimeout        = 5 * time.Second
+	shellOutputCloseGrace          = time.Second
+)
+
+// shellOutput owns the output-pump lifetime. Cancellation is separate from
+// the process lifetime because a pump can be stuck applying data-channel
+// backpressure after the process and its PTY have already exited.
+type shellOutput struct {
+	sync.WaitGroup
+	stop     chan struct{}
+	stopOnce sync.Once
+}
+
+func newShellOutput() *shellOutput {
+	return &shellOutput{stop: make(chan struct{})}
+}
+
+func (o *shellOutput) cancel() {
+	if o != nil {
+		o.stopOnce.Do(func() { close(o.stop) })
+	}
+}
+
+func (o *shellOutput) cancelled() <-chan struct{} {
+	if o == nil {
+		return nil
+	}
+	return o.stop
+}
+
+func (o *shellOutput) wait(timeout time.Duration) bool {
+	if o == nil {
+		return true
+	}
+	done := make(chan struct{})
+	go func() {
+		o.Wait()
+		close(done)
+	}()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return true
+	case <-timer.C:
+		return false
+	}
+}
+
+func finishOutput(output *shellOutput, timeout time.Duration) bool {
+	if output.wait(timeout) {
+		return true
+	}
+	output.cancel()
+	_ = output.wait(shellOutputCloseGrace)
+	return false
+}
+
 // ansiEscape matches the VT/ANSI escape sequences a shell session
 // realistically emits: CSI (ESC [ params intermediates final), OSC
 // (ESC ] ... BEL or ST), and the shorter two-byte ESC X forms.
@@ -198,8 +258,9 @@ type ShellHandler struct {
 
 	Verbose bool
 
-	mu      sync.Mutex
-	streams map[uint32]*shellSession
+	mu                 sync.Mutex
+	streams            map[uint32]*shellSession
+	outputDrainTimeout time.Duration
 }
 
 // shellSession holds the per-stream state: the spawned process plus
@@ -207,12 +268,13 @@ type ShellHandler struct {
 // the same fd is used for both directions, so stdin is nil. In pipe
 // mode stdin is the stdin pipe and ptyFile is nil.
 type shellSession struct {
+	ioMu    sync.Mutex
 	cmd     *exec.Cmd      // pipe mode command
 	ptyCmd  *ptylib.Cmd    // PTY/ConPTY mode command
 	process *os.Process    // process behind either command type
 	ptyFile ptylib.Pty     // PTY mode: master side, used for read + write
 	stdin   io.WriteCloser // pipe mode: dedicated stdin pipe
-	output  sync.WaitGroup // drain output before FIN and terminal close
+	output  *shellOutput   // drain output before FIN and terminal close
 }
 
 func (s *shellSession) wait() error {
@@ -222,13 +284,49 @@ func (s *shellSession) wait() error {
 	return s.cmd.Wait()
 }
 
+func (s *shellSession) writeInput(body []byte) {
+	s.ioMu.Lock()
+	defer s.ioMu.Unlock()
+	if s.ptyFile != nil {
+		_, _ = s.ptyFile.Write(body)
+	} else if s.stdin != nil {
+		_, _ = s.stdin.Write(body)
+	}
+}
+
+func (s *shellSession) resize(cols, rows int) {
+	s.ioMu.Lock()
+	defer s.ioMu.Unlock()
+	if s.ptyFile != nil {
+		_ = s.ptyFile.Resize(cols, rows)
+	}
+}
+
+func (s *shellSession) closeInput() {
+	s.ioMu.Lock()
+	defer s.ioMu.Unlock()
+	if s.stdin != nil {
+		_ = s.stdin.Close()
+		s.stdin = nil
+	}
+}
+
+func (s *shellSession) takePTY() ptylib.Pty {
+	s.ioMu.Lock()
+	defer s.ioMu.Unlock()
+	terminal := s.ptyFile
+	s.ptyFile = nil
+	return terminal
+}
+
 // NewShell returns a ShellHandler with the given default argv. Pass nil
 // or empty to default to $SHELL.
 func NewShell(defaultArgv []string, verbose bool) *ShellHandler {
 	return &ShellHandler{
-		DefaultArgv: defaultArgv,
-		Verbose:     verbose,
-		streams:     make(map[uint32]*shellSession),
+		DefaultArgv:        defaultArgv,
+		Verbose:            verbose,
+		streams:            make(map[uint32]*shellSession),
+		outputDrainTimeout: shellOutputDrainTimeout,
 	}
 }
 
@@ -335,10 +433,10 @@ func (h *ShellHandler) OnSYN(s Stream, payload []byte, final bool) error {
 		rows = 24
 	}
 
-	sess := &shellSession{}
+	sess := &shellSession{output: newShellOutput()}
 	var stdout, stderr io.Reader
 
-	ptyMode := usePTY(open.PTY)
+	ptyMode := open.PTY && platformSupportsPTY
 	if ptyMode {
 		// PTY mode: one fd handles both directions, stdout+stderr
 		// merged. The shell sees a real terminal and emits ANSI escapes,
@@ -412,13 +510,13 @@ func (h *ShellHandler) OnSYN(s Stream, payload []byte, final bool) error {
 	sess.output.Add(1)
 	go func() {
 		defer sess.output.Done()
-		h.pumpReader(s, stdout, shellTagStdout)
+		h.pumpReader(s, stdout, shellTagStdout, sess.output.cancelled())
 	}()
 	if stderr != nil {
 		sess.output.Add(1)
 		go func() {
 			defer sess.output.Done()
-			h.pumpReader(s, stderr, shellTagStderr)
+			h.pumpReader(s, stderr, shellTagStderr, sess.output.cancelled())
 		}()
 	}
 	go h.waitAndFinish(s, sess, argv, h.MaxConcurrent > 0)
@@ -441,10 +539,11 @@ func (h *ShellHandler) OnSYN(s Stream, payload []byte, final bool) error {
 // emitted one line at a time) before reaching the underlying writer.
 // The connector still sees the raw stream over the data channel — the
 // filter only affects what the listener owner sees on their console.
-func (h *ShellHandler) pumpReader(s Stream, r io.Reader, tag byte) {
+func (h *ShellHandler) pumpReader(s Stream, r io.Reader, tag byte, cancelled <-chan struct{}) {
 	// Leave 1 byte of headroom for the tag prefix.
 	buf := make([]byte, protocol.MaxChunkSize-1)
-	const maxBuffered uint64 = 8 << 20
+	backpressureTick := time.NewTicker(time.Millisecond)
+	defer backpressureTick.Stop()
 	var mirror io.Writer
 	switch tag {
 	case shellTagStdout:
@@ -462,8 +561,17 @@ func (h *ShellHandler) pumpReader(s Stream, r io.Reader, tag byte) {
 			if mirror != nil {
 				_, _ = mirror.Write(buf[:n])
 			}
-			for s.BufferedAmount() > maxBuffered {
-				time.Sleep(1 * time.Millisecond)
+			for s.BufferedAmount() > maxShellBuffered {
+				select {
+				case <-cancelled:
+					return
+				case <-backpressureTick.C:
+				}
+			}
+			select {
+			case <-cancelled:
+				return
+			default:
 			}
 			frame := make([]byte, 1+n)
 			frame[0] = tag
@@ -498,11 +606,7 @@ func (h *ShellHandler) OnDAT(s Stream, payload []byte) error {
 
 	switch tag {
 	case shellTagStdin:
-		if sess.ptyFile != nil {
-			_, _ = sess.ptyFile.Write(body)
-		} else if sess.stdin != nil {
-			_, _ = sess.stdin.Write(body)
-		}
+		sess.writeInput(body)
 	case shellTagSignal:
 		// In PTY mode, Ctrl-C usually arrives as byte 0x03 in stdin and
 		// the kernel converts it to SIGINT — this explicit path is
@@ -517,9 +621,7 @@ func (h *ShellHandler) OnDAT(s Stream, payload []byte) error {
 		}
 		cols := binary.LittleEndian.Uint16(body[0:2])
 		rows := binary.LittleEndian.Uint16(body[2:4])
-		if sess.ptyFile != nil {
-			_ = sess.ptyFile.Resize(int(cols), int(rows))
-		}
+		sess.resize(int(cols), int(rows))
 	}
 	return nil
 }
@@ -539,12 +641,20 @@ func (h *ShellHandler) closeStdin(streamID uint32) {
 	if sess == nil {
 		return
 	}
-	if sess.stdin != nil {
-		_ = sess.stdin.Close()
-	}
+	sess.closeInput()
 	// PTY mode: we deliberately don't close ptyFile here — that would
 	// also stop the output flow. The process sees EOF on stdin when
 	// we eventually close the PTY in waitAndFinish (after it exits).
+}
+
+// detachSession stops new DAT dispatch before waiting for any in-flight PTY
+// operation to finish. The returned PTY is exclusively owned by the shutdown
+// path and can be closed without racing input or resize handlers.
+func (h *ShellHandler) detachSession(streamID uint32, running *shellSession) ptylib.Pty {
+	h.mu.Lock()
+	delete(h.streams, streamID)
+	h.mu.Unlock()
+	return running.takePTY()
 }
 
 // waitAndFinish blocks on cmd.Wait(), then emits the FIN trailer with
@@ -553,20 +663,21 @@ func (h *ShellHandler) closeStdin(streamID uint32) {
 // the max-concurrent slot that OnSYN reserved.
 func (h *ShellHandler) waitAndFinish(s Stream, running *shellSession, argv []string, releaseSlot bool) {
 	err := running.wait()
-	// Process exit and output EOF are separate events. Platform-specific PTY
-	// shutdown drains the final bytes before FIN closes the browser stream.
-	if running.ptyFile != nil {
-		finishPTY(running.ptyFile, &running.output)
-		running.ptyFile = nil
-	} else {
-		running.output.Wait()
-	}
-
-	h.mu.Lock()
-	delete(h.streams, s.ID())
-	h.mu.Unlock()
+	terminal := h.detachSession(s.ID(), running)
 	if releaseSlot {
 		activeShellCount.Add(-1)
+	}
+
+	// Process exit and output EOF are separate events. Platform-specific PTY
+	// shutdown drains the final bytes before FIN closes the browser stream.
+	var drained bool
+	if terminal != nil {
+		drained = finishPTY(terminal, running.output, h.outputDrainTimeout)
+	} else {
+		drained = finishOutput(running.output, h.outputDrainTimeout)
+	}
+	if !drained {
+		log.Printf("Shell output drain timed out: argv=%v", argv)
 	}
 
 	exitCode := 0
