@@ -9,7 +9,10 @@ on:
 
 jobs:
   unit:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 5
 
     steps:
@@ -19,12 +22,34 @@ jobs:
         with:
           go-version: '1.25'
 
-      # ./... rather than ./internal/... — the latter silently skipped
+      # ./... rather than ./internal/... -- the latter silently skipped
       # every test under cmd/bitbang (arg reordering, serve-mode routing,
       # the known-hosts device table, remote-spec parsing), which is the
       # CLI surface users actually touch.
       - name: Run unit tests
         run: go test ./... -v
+
+  vuln:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+
+      # Symbol-level, not just "is this module version listed": govulncheck
+      # traces whether our code actually reaches the vulnerable function, so
+      # it does not fire on the ~20 advisories in modules we require but
+      # never call. That precision is what makes failing the build reasonable.
+      #
+      # It earned its place on the first run: GO-2026-5942, a panic parsing a
+      # malformed SVCB/HTTPS record, reachable from localdns.queryMDNS via
+      # pion/mdns. Multicast means anything on the LAN could trigger it.
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
 
   e2e:
     runs-on: ubuntu-latest
@@ -50,6 +75,8 @@ jobs:
           playwright install --with-deps chromium
 
       - name: Run E2E tests
+        env:
+          BITBANG_BIN: ${{ github.workspace }}/bitbangproxy
         run: python -m pytest tests/e2e/ -v --timeout=60 --timeout-method=thread --screenshot=only-on-failure --output=tests/e2e/screenshots
 
       - name: Upload screenshots on failure

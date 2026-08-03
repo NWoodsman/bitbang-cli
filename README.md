@@ -87,7 +87,7 @@ Every successful connect or pairing is saved to `~/.bitbang/devices.json`, so fr
 
 ## Install
 
-The one-liner detects your arch (`amd64`, `arm64`, `armv7`), downloads the binary from the latest [GitHub release](https://github.com/richlegrand/bitbang-cli/releases), verifies its SHA-256 against the release's `checksums.txt`, and installs to `~/.local/bin/bitbang`.
+The one-liner works on Linux and macOS. It detects your OS and arch (`amd64`, `arm64`, and `armv7` on Linux), downloads the binary from the latest [GitHub release](https://github.com/richlegrand/bitbang-cli/releases), verifies its SHA-256 against the release's `checksums.txt`, and installs to `~/.local/bin/bitbang`.
 
 Pin a version, change the location, or audit the script first:
 
@@ -98,7 +98,23 @@ curl -sSfL bitba.ng/install | sh -s -- --prefix /usr/local/bin
 curl -sSfL bitba.ng/install -o install.sh && less install.sh && sh install.sh
 ```
 
-macOS and Windows builds are coming -- issues have been created for each ([macOS](https://github.com/richlegrand/bitbang-cli/issues/2), [windows](https://github.com/richlegrand/bitbang-cli/issues/1), just react or post to show me you're insterested . **Manual install:** download the binary from Releases and place it on your PATH. **Build from source:** see [below](#building-from-source).
+Windows builds are published as `bitbang-windows-amd64.exe` and
+`bitbang-windows-arm64.exe`. Download the appropriate binary from Releases,
+rename it to `bitbang.exe`, and place it on your `PATH`.
+**Build from source:** see [below](#building-from-source).
+
+**macOS and Gatekeeper.** The install one-liner above is unaffected: `curl` does
+not set the `com.apple.quarantine` attribute, so the binary it fetches runs
+normally. If you instead download `bitbang-darwin-arm64` from the Releases page
+in a browser, macOS quarantines it and refuses to open it, because the release
+binaries are not notarized. Clear it with either of:
+
+```
+xattr -d com.apple.quarantine ./bitbang-darwin-arm64
+```
+
+or right-click the file in Finder and choose Open, which offers a one-time
+override. Alternatively, build from source, which never quarantines.
 
 ### How the install URL works
 
@@ -124,14 +140,14 @@ How the two ends authenticate each other without trusting the signaling server i
 
 ## How it compares
 
-|                                 | ngrok         | Cloudflare Tunnel | Tailscale                | `bitbang`        |
-| ------------------------------- | ------------- | ----------------- | ------------------------ | ---------------- |
-| Account required                | Yes           | Yes               | Yes                      | **No**           |
-| Install on the connecting side  | No            | No                | **Yes**                  | **No** (browser) |
-| End-to-end encrypted            | Not by default | No               | Yes                      | **Yes**          |
-| Data path                       | Their servers | Their servers     | P2P                      | **P2P**          |
-| Self-hostable server (open source) | No         | No                | No (Headscale is third-party) | **Yes**     |
-| Setup before first use          | Account + authtoken | Account + DNS | Account + login on each device | **Run one command** |
+|                                    | ngrok               | Cloudflare Tunnel | Tailscale                      | frp                                 | `bitbang`           |
+| ---------------------------------- | ------------------- | ----------------- | ------------------------------ | ----------------------------------- | ------------------- |
+| Account required                   | Yes                 | Yes               | Yes                            | No                                  | **No**              |
+| Install on the connecting side     | No                  | No                | **Yes**                        | No (**Yes** for P2P mode)           | **No** (browser)    |
+| End-to-end encrypted               | Not by default      | No                | Yes                            | No -- your server sees traffic      | **Yes**             |
+| Data path                          | Their servers       | Their servers     | P2P                            | Your server (P2P optional)          | **P2P**             |
+| Self-hostable server (open source) | No                  | No                | No (Headscale is third-party)  | **Yes**                             | **Yes**             |
+| Setup before first use             | Account + authtoken | Account + DNS     | Account + login on each device | A public-IP server + TOML both ends | **Run one command** |
 
 
 ## Command reference
@@ -167,7 +183,7 @@ bitbang help                           Usage (also --help, -h)
 
 | Flag                    | Default               | Description                                   |
 | ----------------------- | --------------------- | --------------------------------------------- |
-| `-shell-cmd CMD`        | `$SHELL` or `/bin/sh` | Shell to spawn                                |
+| `-shell-cmd CMD`        | platform shell        | `$SHELL`/`/bin/sh` on Unix; `%COMSPEC%`/`cmd.exe` on Windows |
 | `-shell-max-sessions N` | `1`                   | Max concurrent shell sessions (0 = unlimited) |
 | `-shell-mirror`         | on                    | Mirror shell output to the listener's console |
 
@@ -240,6 +256,20 @@ GOOS=linux   GOARCH=arm GOARM=7  go build -o bitbang-armv7 ./cmd/bitbang/
 GOOS=windows GOARCH=amd64        go build -o bitbang.exe   ./cmd/bitbang/
 GOOS=darwin  GOARCH=arm64        go build -o bitbang-macos ./cmd/bitbang/
 ```
+
+From Windows Command Prompt:
+
+```bat
+go build -o bitbang.exe .\cmd\bitbang
+go test .\...
+run_tests.cmd unit
+```
+
+Shell commands, file sharing, proxying, and the CLI client are supported on
+Windows. Interactive browser and CLI shells use Windows ConPTY, including
+terminal input echo, line editing, VT output, and resize events. ConPTY requires
+Windows 10 version 1809 or Windows Server 2019 or later.
+
 ## Diagrams
 
 <p align="center">
@@ -252,7 +282,7 @@ GOOS=darwin  GOARCH=arm64        go build -o bitbang-macos ./cmd/bitbang/
 Shipping today: **shell, files, and proxy**, reachable from the browser or the CLI, plus scp-style file copy and **ad-hoc pairing** with a saved device table. Designed and on the way:
 
 - **Serial bridging** -- drive a remote `/dev/ttyUSB0` from a local virtual port (e.g. run Arduino IDE over the internet). An issue has been opened [here](https://github.com/richlegrand/bitbang-cli/issues/3).
-- **TCP port forwarding** -- `-L 5432:db.internal:5432` to reach LAN-only services. And issue has been opened [here](https://github.com/richlegrand/bitbang-cli/issues/4).
+- **TCP port forwarding** -- `-L 5432:db.internal:5432` to reach LAN-only services. An issue has been opened [here](https://github.com/richlegrand/bitbang-cli/issues/4).
 - **Terminal sharing** -- turn a *running* terminal session into a URL -- walk away mid-task and reopen it on your phone, or hand the link to someone else, perhaps useful for AI coding sessions. An issue has been opened [here](https://github.com/richlegrand/bitbang-cli/issues/5).
 - **Remote desktop** -- screen over a WebRTC video track, keyboard/mouse over the data channel.
 
