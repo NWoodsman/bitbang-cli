@@ -14,11 +14,18 @@ import (
 	"github.com/richlegrand/bitbang/internal/tcpforward"
 )
 
+// DefaultTCPMaxConcurrent bounds active TCP connections per WebRTC session.
+const DefaultTCPMaxConcurrent = 64
+
 // TCPHandler implements StreamHandler for type="tcp". Each stream dials one
 // target from the listener's network and preserves directional EOF in both
 // directions.
 type TCPHandler struct {
 	Verbose bool
+
+	// MaxConcurrent caps active TCP streams for this WebRTC session,
+	// including pending dials. 0 disables the limit.
+	MaxConcurrent int
 
 	// DialContext is injectable for focused tests. Production uses the same
 	// mDNS-aware resolver as the HTTP and WebSocket proxy paths.
@@ -28,6 +35,7 @@ type TCPHandler struct {
 	cancel  context.CancelFunc
 	mu      sync.Mutex
 	streams map[uint32]*tcpStream
+	active  int
 }
 
 type tcpInbound struct {
@@ -49,11 +57,12 @@ type tcpStream struct {
 func NewTCP(verbose bool) *TCPHandler {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &TCPHandler{
-		Verbose:     verbose,
-		DialContext: localdns.Default.DialContext,
-		ctx:         ctx,
-		cancel:      cancel,
-		streams:     make(map[uint32]*tcpStream),
+		Verbose:       verbose,
+		MaxConcurrent: DefaultTCPMaxConcurrent,
+		DialContext:   localdns.Default.DialContext,
+		ctx:           ctx,
+		cancel:        cancel,
+		streams:       make(map[uint32]*tcpStream),
 	}
 }
 
@@ -71,6 +80,14 @@ func (h *TCPHandler) OnSYN(s Stream, payload []byte, final bool) error {
 		return nil
 	}
 
+	h.mu.Lock()
+	old := h.streams[s.ID()]
+	if h.MaxConcurrent > 0 && h.active >= h.MaxConcurrent {
+		h.mu.Unlock()
+		log.Printf("TCP rejected: at max-streams=%d", h.MaxConcurrent)
+		h.sendError(s, "listener is busy (max "+strconv.Itoa(h.MaxConcurrent)+" concurrent TCP connections)")
+		return nil
+	}
 	ctx, cancel := context.WithCancel(h.ctx)
 	ts := &tcpStream{
 		ctx:     ctx,
@@ -78,9 +95,8 @@ func (h *TCPHandler) OnSYN(s Stream, payload []byte, final bool) error {
 		stream:  s,
 		inbound: make(chan tcpInbound, 256),
 	}
-	h.mu.Lock()
-	old := h.streams[s.ID()]
 	h.streams[s.ID()] = ts
+	h.active++
 	h.mu.Unlock()
 	if old != nil {
 		old.close()
@@ -126,19 +142,19 @@ func (h *TCPHandler) OnFIN(s Stream, payload []byte) error {
 }
 
 func (h *TCPHandler) runStream(ts *tcpStream, open protocol.TCPOpen) {
+	defer h.remove(ts.stream.ID(), ts)
+
 	address := net.JoinHostPort(open.Host, strconv.Itoa(open.Port))
 	conn, err := h.DialContext(ts.ctx, "tcp", address)
 	if err != nil {
 		if ts.ctx.Err() == nil {
 			h.sendError(ts.stream, "dial "+address+": "+err.Error())
 		}
-		h.remove(ts.stream.ID(), ts)
 		ts.cancel()
 		return
 	}
 	if !ts.setConn(conn) {
 		_ = conn.Close()
-		h.remove(ts.stream.ID(), ts)
 		return
 	}
 
@@ -146,7 +162,6 @@ func (h *TCPHandler) runStream(ts *tcpStream, open protocol.TCPOpen) {
 	if err := ts.stream.WriteSYN(ack); err != nil {
 		ts.cancel()
 		_ = conn.Close()
-		h.remove(ts.stream.ID(), ts)
 		return
 	}
 	if h.Verbose {
@@ -168,7 +183,6 @@ func (h *TCPHandler) runStream(ts *tcpStream, open protocol.TCPOpen) {
 	}
 	ts.cancel()
 	_ = conn.Close()
-	h.remove(ts.stream.ID(), ts)
 	if h.Verbose {
 		log.Printf("TCP stream %d closed (%s)", ts.stream.ID(), address)
 	}
@@ -203,6 +217,7 @@ func (h *TCPHandler) remove(id uint32, want *tcpStream) {
 	if h.streams[id] == want {
 		delete(h.streams, id)
 	}
+	h.active--
 	h.mu.Unlock()
 }
 

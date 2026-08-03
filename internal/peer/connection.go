@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"log"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pion/webrtc/v4"
@@ -210,9 +211,9 @@ func setupConnection(s connSetup) (*Connection, error) {
 		s.onOpen(conn, dc)
 	})
 
-	dcClosed := false
+	var dcClosed atomic.Bool
 	dc.OnClose(func() {
-		dcClosed = true
+		dcClosed.Store(true)
 		log.Printf("%s data channel closed for %s", s.logTag, s.clientID)
 		// Run caller-supplied cleanup BEFORE closing the PC, so any
 		// resources tied to the data channel (e.g. spawned shell
@@ -240,7 +241,7 @@ func setupConnection(s connSetup) (*Connection, error) {
 	})
 
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
-		if dcClosed {
+		if dcClosed.Load() {
 			return
 		}
 		if s.verbose {

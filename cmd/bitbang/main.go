@@ -8,7 +8,8 @@
 //	bitbang serve files [PATH] [flags]            # files only, PATH defaults to cwd
 //	bitbang serve proxy [flags]                   # proxy only (HTTP reverse proxy)
 //	bitbang cp <src> <dst>                        (one side is <URL>:/path, or `-`)
-//	bitbang connect <URL> [-L port:host:port] [-- argv]
+//	bitbang connect <URL> [-- argv]               # shell or command
+//	bitbang connect <URL> -L port:host:port       # forwarding only
 //
 // `bitbang serve` is the umbrella mode — its default cap set (today:
 // shell + files + proxy + TCP) is what most users want, and the hamburger
@@ -91,8 +92,9 @@ func printUsage() {
 	fmt.Println("  bitbang serve files [PATH] [flags]     Files only (PATH defaults to cwd)")
 	fmt.Println("  bitbang serve proxy [flags]            Proxy only (HTTP reverse proxy)")
 	fmt.Println("  bitbang cp <src> <dst>                 Copy files (one side is <URL>:/path, or '-')")
-	fmt.Println("  bitbang connect <URL-or-code> [-L port:host:port] [-- ...]")
-	fmt.Println("                                             Open shell with optional local TCP forwarding")
+	fmt.Println("  bitbang connect <URL-or-code> [-- ...]  Open a shell or run a command")
+	fmt.Println("  bitbang connect <URL-or-code> -L port:host:port [-L ...] [-g]")
+	fmt.Println("                                             Hold local TCP forwards without a shell")
 	fmt.Println()
 	fmt.Println("Run `bitbang serve --help` (or with a mode) for the available flags.")
 }

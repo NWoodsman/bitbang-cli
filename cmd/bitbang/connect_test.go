@@ -2,8 +2,10 @@ package main
 
 import (
 	"io"
+	"os"
 	"reflect"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/richlegrand/bitbang/internal/tcpforward"
@@ -15,7 +17,6 @@ func TestParseConnectOptionsRepeatedForwardsAndReorderedFlags(t *testing.T) {
 		"-L", "15432:db.internal:5432",
 		"-g",
 		"-L", "14450:nas.local:445",
-		"--", "sh", "-c", "echo ok",
 	}, io.Discard)
 	if err != nil {
 		t.Fatalf("parseConnectOptions: %v", err)
@@ -30,8 +31,24 @@ func TestParseConnectOptionsRepeatedForwardsAndReorderedFlags(t *testing.T) {
 	if !got.gateway {
 		t.Fatal("gateway = false, want true")
 	}
+}
+
+func TestParseConnectOptionsRemoteCommand(t *testing.T) {
+	got, err := parseConnectOptions([]string{"device1", "--", "sh", "-c", "echo ok"}, io.Discard)
+	if err != nil {
+		t.Fatalf("parseConnectOptions: %v", err)
+	}
 	if want := []string{"sh", "-c", "echo ok"}; !reflect.DeepEqual(got.argv, want) {
 		t.Fatalf("argv = %q, want %q", got.argv, want)
+	}
+}
+
+func TestParseConnectOptionsRejectsForwardWithCommand(t *testing.T) {
+	_, err := parseConnectOptions([]string{
+		"device1", "-L", "15432:db.internal:5432", "--", "echo", "ok",
+	}, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "cannot be combined") {
+		t.Fatalf("error = %v, want -L/command conflict", err)
 	}
 }
 
@@ -76,5 +93,25 @@ func TestParseLocalForwardRejectsMalformedMappings(t *testing.T) {
 func TestParseConnectOptionsRejectsGatewayWithoutForward(t *testing.T) {
 	if _, err := parseConnectOptions([]string{"device1", "-g"}, io.Discard); err == nil || !strings.Contains(err.Error(), "requires") {
 		t.Fatalf("error = %v, want -g requires -L", err)
+	}
+}
+
+func TestWaitForForwardExit(t *testing.T) {
+	t.Run("session closes", func(t *testing.T) {
+		done := make(chan struct{})
+		close(done)
+		if !waitForForwardExit(done, make(chan os.Signal)) {
+			t.Fatal("sessionClosed = false, want true")
+		}
+	})
+
+	for _, sig := range []os.Signal{syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP} {
+		t.Run(sig.String(), func(t *testing.T) {
+			signals := make(chan os.Signal, 1)
+			signals <- sig
+			if waitForForwardExit(make(chan struct{}), signals) {
+				t.Fatal("sessionClosed = true, want false")
+			}
+		})
 	}
 }

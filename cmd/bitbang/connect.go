@@ -109,7 +109,7 @@ func parseConnectOptions(args []string, output io.Writer) (connectOptions, error
 	fs.StringVar(&opts.server, "server", "bitba.ng", "Signaling server (pair-code mode only; URL form carries its own server)")
 	fs.StringVar(&opts.name, "name", "", "Name to remember this device under (new devices only; auto-assigned if omitted)")
 	fs.BoolVar(&opts.relay, "relay", false, "Request a TURN relay up front instead of only on fallback (ICE still prefers direct if it succeeds)")
-	fs.Var(&opts.forwards, "L", "Forward LOCAL_PORT:REMOTE_HOST:REMOTE_PORT (repeatable; bracket IPv6 hosts)")
+	fs.Var(&opts.forwards, "L", "Forward LOCAL_PORT:REMOTE_HOST:REMOTE_PORT without opening a shell (repeatable; bracket IPv6 hosts)")
 	fs.BoolVar(&opts.gateway, "g", false, "Bind forwarded ports on 0.0.0.0 instead of 127.0.0.1")
 	if err := fs.Parse(reorderArgs(fs, args)); err != nil {
 		return connectOptions{}, err
@@ -127,6 +127,9 @@ func parseConnectOptions(args []string, output io.Writer) (connectOptions, error
 			opts.argv = posArgs[2+i:]
 			break
 		}
+	}
+	if len(opts.forwards) > 0 && len(opts.argv) > 0 {
+		return connectOptions{}, fmt.Errorf("-L cannot be combined with a remote command")
 	}
 	return opts, nil
 }
@@ -148,6 +151,9 @@ func parseConnectOptions(args []string, output io.Writer) (connectOptions, error
 // is assigned and printed.
 //
 // Mode auto-detection (URL flow only):
+//   - Forwarding: one or more -L mappings are given. Open the local listeners
+//     and hold them until a signal arrives or the WebRTC session closes. No
+//     shell stream is opened.
 //   - Interactive: stdin is a TTY and no argv is given. Allocate a PTY
 //     on the listener, put local terminal in raw mode, forward
 //     keystrokes, render output, watch SIGWINCH for resize.
@@ -168,7 +174,8 @@ func runConnect(args []string) {
 	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "bitbang connect: %v\n", err)
-		fmt.Fprintln(os.Stderr, "Usage: bitbang connect <URL-or-pair-code> [-L port:host:port ...] [-g] [-- argv...]")
+		fmt.Fprintln(os.Stderr, "Usage: bitbang connect <URL-or-pair-code> [-- argv...]")
+		fmt.Fprintln(os.Stderr, "   or: bitbang connect <URL-or-pair-code> -L port:host:port [-L ...] [-g]")
 		os.Exit(2)
 	}
 	urlArg := opts.target
@@ -226,12 +233,6 @@ func runConnect(args []string) {
 		}
 	}
 
-	// Mode decision: PTY only when stdin is a real terminal AND no argv
-	// was supplied. With argv, the user wants a one-shot command run
-	// non-interactively (suitable for scripting / piping).
-	stdinIsTTY := term.IsTerminal(int(os.Stdin.Fd()))
-	interactive := stdinIsTTY && len(opts.argv) == 0
-
 	fmt.Fprintf(os.Stderr, "Connecting to %s...\n", rs.Server)
 	sess := dialConnect(rs, opts.verbose, opts.timeout, opts.pin, opts.relay, len(opts.forwards) > 0)
 	var forwarder *client.LocalForwarder
@@ -255,6 +256,24 @@ func runConnect(args []string) {
 	if !saved {
 		recordAndReport(rs, opts.name)
 	}
+	if forwarder != nil {
+		signals := make(chan os.Signal, 1)
+		signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+		sessionClosed := waitForForwardExit(sess.Done(), signals)
+		signal.Stop(signals)
+		forwarder.Close()
+		sess.Close()
+		if sessionClosed {
+			fail("connect: connection closed")
+		}
+		return
+	}
+
+	// PTY only when stdin is a real terminal AND no argv was supplied.
+	// With argv, the user wants a one-shot command run non-interactively
+	// (suitable for scripting / piping).
+	stdinIsTTY := term.IsTerminal(int(os.Stdin.Fd()))
+	interactive := stdinIsTTY && len(opts.argv) == 0
 
 	shellOpts := client.ShellOptions{
 		Argv:   opts.argv,
@@ -278,9 +297,6 @@ func runConnect(args []string) {
 
 	result, err := sess.Shell(shellOpts)
 	restore() // BEFORE any os.Exit, including via fail().
-	if forwarder != nil {
-		forwarder.Close()
-	}
 	sess.Close()
 	if err != nil {
 		fail("connect: %v", err)
@@ -292,6 +308,18 @@ func runConnect(args []string) {
 		os.Exit(128)
 	}
 	os.Exit(result.ExitCode)
+}
+
+// waitForForwardExit blocks until the WebRTC session closes or an operator
+// signal arrives. It reports session closure so the caller can distinguish an
+// unexpected disconnect from a graceful signal-driven shutdown.
+func waitForForwardExit(sessionDone <-chan struct{}, signals <-chan os.Signal) (sessionClosed bool) {
+	select {
+	case <-sessionDone:
+		return true
+	case <-signals:
+		return false
+	}
 }
 
 // setupInteractive flips the local terminal into raw mode, installs a
@@ -402,18 +430,18 @@ func recordAndReport(rs remoteSpec, name string) {
 	}
 }
 
-// dialConnect handles the boilerplate: build DialOptions, run the
-// handshake, sanity-check that the listener advertises "shell."
+// dialConnect handles the boilerplate: build DialOptions, run the handshake,
+// and sanity-check that the listener advertises the requested stream type.
 func dialConnect(r remoteSpec, verbose bool, timeout time.Duration, suppliedPIN string, relay, tcp bool) *client.Session {
-	caps := []string{"shell"}
+	capability := "shell"
 	if tcp {
-		caps = append(caps, "tcp")
+		capability = "tcp"
 	}
 	opts := client.DialOptions{
 		Server:      r.Server,
 		UID:         r.UID,
 		Code:        r.Code,
-		Caps:        caps,
+		Caps:        []string{capability},
 		DialTimeout: timeout,
 		ForceRelay:  relay,
 		Verbose:     verbose,
@@ -423,13 +451,9 @@ func dialConnect(r remoteSpec, verbose bool, timeout time.Duration, suppliedPIN 
 	if err != nil {
 		fail("connect: %v", err)
 	}
-	if !hasCap(sess.ServerCaps, "shell") {
+	if !hasCap(sess.ServerCaps, capability) {
 		sess.Close()
-		fail("connect: listener does not advertise the `shell` capability (caps: %v)", sess.ServerCaps)
-	}
-	if tcp && !hasCap(sess.ServerCaps, "tcp") {
-		sess.Close()
-		fail("connect: listener does not advertise the `tcp` capability (caps: %v)", sess.ServerCaps)
+		fail("connect: listener does not advertise the `%s` capability (caps: %v)", capability, sess.ServerCaps)
 	}
 	return sess
 }

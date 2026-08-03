@@ -192,7 +192,7 @@ With no `-- command`, opens an interactive shell (a PTY when stdin is a terminal
 
 | Flag                                    | Default    | Description                                                                                                 |
 | --------------------------------------- | ---------- | ----------------------------------------------------------------------------------------------------------- |
-| `-L LOCAL_PORT:REMOTE_HOST:REMOTE_PORT` | (none)     | Forward `LOCAL_PORT` to `REMOTE_HOST:REMOTE_PORT` (repeatable; bracket IPv6 hosts)                           |
+| `-L LOCAL_PORT:REMOTE_HOST:REMOTE_PORT` | (none)     | Forward `LOCAL_PORT` to `REMOTE_HOST:REMOTE_PORT` without a shell (repeatable; bracket IPv6 hosts)           |
 | `-g`                                    | off        | Bind forwarded ports on `0.0.0.0` instead of `127.0.0.1`                                                   |
 | `-name NAME`                            | (auto)     | Remember this host under NAME (new hosts only; auto-assigns `device<N>` if omitted)                         |
 | `-relay`                                | off        | Request a TURN relay up front instead of only on fallback (ICE still prefers a direct path if one succeeds) |

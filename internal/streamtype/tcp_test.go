@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -20,7 +21,11 @@ type tcpTestStream struct {
 }
 
 func newTCPTestStream() *tcpTestStream {
-	return &tcpTestStream{id: 7, frames: make(chan protocol.Frame, 32)}
+	return newTCPTestStreamID(7)
+}
+
+func newTCPTestStreamID(id uint32) *tcpTestStream {
+	return &tcpTestStream{id: id, frames: make(chan protocol.Frame, 32)}
 }
 
 func (s *tcpTestStream) ID() uint32          { return s.id }
@@ -202,6 +207,52 @@ func TestTCPHandlerCloseAllCancelsPendingDial(t *testing.T) {
 	case frame := <-s.frames:
 		t.Fatalf("session cleanup emitted unexpected frame: %#v", frame)
 	case <-time.After(20 * time.Millisecond):
+	}
+}
+
+func TestTCPHandlerRejectsStreamsOverLimit(t *testing.T) {
+	started := make(chan struct{}, 2)
+	finished := make(chan struct{}, 2)
+	h := NewTCP(false)
+	h.MaxConcurrent = 1
+	h.DialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
+		started <- struct{}{}
+		<-ctx.Done()
+		finished <- struct{}{}
+		return nil, ctx.Err()
+	}
+
+	first := newTCPTestStreamID(7)
+	tcpSYN(t, h, first, "first.internal", 80)
+	<-started
+
+	second := newTCPTestStreamID(9)
+	tcpSYN(t, h, second, "second.internal", 80)
+	frame := nextTCPFrame(t, second)
+	if !frame.IsSYN() || !frame.IsFIN() {
+		t.Fatalf("flags = %#x, want SYN|FIN", frame.Flags)
+	}
+	var status struct {
+		Status string `json:"status"`
+		Error  string `json:"error"`
+	}
+	if err := json.Unmarshal(frame.Payload, &status); err != nil {
+		t.Fatalf("response JSON: %v", err)
+	}
+	if status.Status != "error" || !strings.Contains(status.Error, "max 1") {
+		t.Fatalf("status = %#v, want an error", status)
+	}
+	select {
+	case <-started:
+		t.Fatal("over-limit stream reached DialContext")
+	default:
+	}
+
+	h.CloseAll()
+	select {
+	case <-finished:
+	case <-time.After(2 * time.Second):
+		t.Fatal("accepted stream was not canceled")
 	}
 }
 

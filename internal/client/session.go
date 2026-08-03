@@ -250,6 +250,9 @@ func (s *Session) startDispatcher(p *Peer) {
 			case st.inbox <- frame:
 			case <-st.abandoned:
 				continue
+			case <-p.DCClosed():
+				s.markClosed()
+				return
 			case <-s.done:
 				return
 			}

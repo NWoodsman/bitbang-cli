@@ -99,7 +99,15 @@ func (f *LocalForwarder) acceptLoop(ln net.Listener, forward tcpforward.Forward)
 func (f *LocalForwarder) forward(conn net.Conn, forward tcpforward.Forward) error {
 	defer conn.Close()
 	st := f.session.OpenStream()
-	defer st.Close()
+	established := false
+	defer func() {
+		if !established {
+			// The listener's SYN|FIN closes only its direction. Close ours too
+			// so it can release the per-stream routing entry after setup fails.
+			_ = st.WriteFIN(nil)
+		}
+		st.Close()
+	}()
 
 	syn, _ := json.Marshal(protocol.TCPOpen{Type: "tcp", Host: forward.Host, Port: forward.Port})
 	if err := st.WriteSYN(syn); err != nil {
@@ -132,6 +140,7 @@ func (f *LocalForwarder) forward(conn net.Conn, forward tcpforward.Forward) erro
 	if first.IsFIN() {
 		return errors.New("tcp stream closed during setup")
 	}
+	established = true
 
 	ctx, cancel := context.WithCancel(f.ctx)
 	defer cancel()

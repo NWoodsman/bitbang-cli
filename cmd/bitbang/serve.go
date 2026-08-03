@@ -431,7 +431,7 @@ func startListener(cfg serveConfig) {
 	if pinAuth.Required() {
 		fmt.Println("PIN protection enabled.")
 	} else if cfg.shellEnabled {
-		fmt.Fprintf(os.Stderr, "%sWarning: anyone with this URL gets a shell on this machine.%s\n", bold, reset)
+		fmt.Fprintf(os.Stderr, "%sWarning: anyone with this URL gets a shell and unrestricted TCP access from this machine.%s\n", bold, reset)
 		fmt.Fprintln(os.Stderr, "  Use --pin <PIN> for a second factor, or pick a non-shell mode.")
 	}
 
@@ -706,7 +706,7 @@ func printSharingBlock(cfg serveConfig, share *fileshare.FileShare) {
 		}
 		shellLine += ")"
 		fmt.Println(shellLine)
-		fmt.Println("  • tcp    (targets chosen by connect -L; loopback-bound on the connector by default)")
+		fmt.Printf("  • tcp    (unrestricted targets chosen by connect -L; max %d concurrent connections per session; loopback-bound on connector by default)\n", streamtype.DefaultTCPMaxConcurrent)
 	}
 	if cfg.filesEnabled && share != nil {
 		if share.Mode == fileshare.ModeSend {

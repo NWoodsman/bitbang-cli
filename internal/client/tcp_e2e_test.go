@@ -10,9 +10,25 @@ import (
 	"time"
 
 	"github.com/richlegrand/bitbang/internal/bytestream"
+	"github.com/richlegrand/bitbang/internal/protocol"
 	"github.com/richlegrand/bitbang/internal/streamtype"
 	"github.com/richlegrand/bitbang/internal/tcpforward"
 )
+
+type rejectingTCPHandler struct {
+	fin chan uint32
+}
+
+func (h *rejectingTCPHandler) Type() string             { return "tcp" }
+func (h *rejectingTCPHandler) OnConnect(_ string) error { return nil }
+func (h *rejectingTCPHandler) OnSYN(s streamtype.Stream, _ []byte, _ bool) error {
+	return s.SendRaw(protocol.FlagSYN|protocol.FlagFIN, []byte(`{"status":"error","error":"rejected"}`))
+}
+func (h *rejectingTCPHandler) OnDAT(streamtype.Stream, []byte) error { return nil }
+func (h *rejectingTCPHandler) OnFIN(s streamtype.Stream, _ []byte) error {
+	h.fin <- s.ID()
+	return nil
+}
 
 func startTCPEcho(t *testing.T) net.Listener {
 	t.Helper()
@@ -177,6 +193,47 @@ func TestSession_TCPForwardingEndToEnd(t *testing.T) {
 	if conn, err := net.DialTimeout("tcp4", fmt.Sprintf("127.0.0.1:%d", goodLocal), 100*time.Millisecond); err == nil {
 		_ = conn.Close()
 		t.Fatal("local listener survived session teardown")
+	}
+}
+
+func TestSession_TCPForwardSetupFailureClosesClientDirection(t *testing.T) {
+	if testing.Short() {
+		t.Skip("e2e: spins up real pion peer connections and a TCP listener")
+	}
+	id := ephemeralID(t)
+	relay := newFakeSignaling()
+	t.Cleanup(relay.Close)
+	handler := &rejectingTCPHandler{fin: make(chan uint32, 1)}
+	startListener(relay.host(), id, handler)
+	waitRegistered(t, relay)
+	sess := mustDial(t, relay.host(), id, "tcp")
+	t.Cleanup(sess.Close)
+
+	localPort := unusedTCPPorts(t, 1)[0]
+	forwarder, err := sess.StartLocalForwarding([]tcpforward.Forward{{
+		LocalPort: localPort,
+		Host:      "rejected.internal",
+		Port:      80,
+	}}, false)
+	if err != nil {
+		t.Fatalf("StartLocalForwarding: %v", err)
+	}
+	t.Cleanup(forwarder.Close)
+
+	conn, err := net.DialTimeout("tcp4", fmt.Sprintf("127.0.0.1:%d", localPort), 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial local forward: %v", err)
+	}
+	defer conn.Close()
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := conn.Read(make([]byte, 1)); err == nil {
+		t.Fatal("rejected forward remained open")
+	}
+
+	select {
+	case <-handler.fin:
+	case <-time.After(2 * time.Second):
+		t.Fatal("client did not close its side of the rejected TCP stream")
 	}
 }
 
