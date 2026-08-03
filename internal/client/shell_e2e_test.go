@@ -4,12 +4,55 @@ package client
 // shell-stream listener.
 
 import (
+	"bufio"
 	"bytes"
+	"fmt"
+	"io"
+	"os"
 	"strings"
 	"testing"
 
 	"github.com/richlegrand/bitbang/internal/streamtype"
+	"golang.org/x/term"
 )
+
+const shellHelperEnv = "GO_BITBANG_SHELL_HELPER"
+
+func shellHelperArgv(t *testing.T, action string) []string {
+	t.Helper()
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	return []string{exe, "-test.run=TestShellHelperProcess", "--", action}
+}
+
+// TestShellHelperProcess makes the shell E2E tests independent of Unix tools.
+// The test binary re-execs itself as a tiny echo/cat/exit/TTY probe command.
+func TestShellHelperProcess(t *testing.T) {
+	if os.Getenv(shellHelperEnv) != "1" {
+		return
+	}
+	action := os.Args[len(os.Args)-1]
+	switch action {
+	case "echo":
+		fmt.Print("piped-hello-42")
+	case "cat":
+		_, _ = io.Copy(os.Stdout, os.Stdin)
+	case "exit3":
+		os.Exit(3)
+	case "tty":
+		if term.IsTerminal(int(os.Stdin.Fd())) {
+			fmt.Print("IS_TTY")
+		} else {
+			fmt.Print("NOT_TTY")
+		}
+	case "line":
+		line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+		fmt.Print("RECEIVED:" + line)
+	}
+	os.Exit(0)
+}
 
 // shellSession wires a shell-stream listener and returns a connected connector
 // Session. Listener + session teardown is registered via t.Cleanup.
@@ -36,7 +79,9 @@ func TestSession_ShellCommand_Piping(t *testing.T) {
 
 	// 1. Command stdout capture: connect <url> -- echo piped-hello-42
 	var out bytes.Buffer
-	res, err := sess.Shell(ShellOptions{Argv: []string{"echo", "piped-hello-42"}, Stdout: &out})
+	res, err := sess.Shell(ShellOptions{
+		Argv: shellHelperArgv(t, "echo"), Env: map[string]string{shellHelperEnv: "1"}, Stdout: &out,
+	})
 	if err != nil {
 		t.Fatalf("Shell echo: %v", err)
 	}
@@ -50,7 +95,8 @@ func TestSession_ShellCommand_Piping(t *testing.T) {
 	// 2. True stdin→remote→stdout piping: echo from-stdin-7e | connect <url> -- cat
 	var catOut bytes.Buffer
 	res2, err := sess.Shell(ShellOptions{
-		Argv:   []string{"cat"},
+		Argv:   shellHelperArgv(t, "cat"),
+		Env:    map[string]string{shellHelperEnv: "1"},
 		Stdin:  strings.NewReader("from-stdin-7e\n"),
 		Stdout: &catOut,
 	})
@@ -65,7 +111,9 @@ func TestSession_ShellCommand_Piping(t *testing.T) {
 	}
 
 	// 3. Non-zero exit propagation: connect <url> -- sh -c 'exit 3'
-	res3, err := sess.Shell(ShellOptions{Argv: []string{"sh", "-c", "exit 3"}})
+	res3, err := sess.Shell(ShellOptions{
+		Argv: shellHelperArgv(t, "exit3"), Env: map[string]string{shellHelperEnv: "1"},
+	})
 	if err != nil {
 		t.Fatalf("Shell exit-code: %v", err)
 	}
@@ -87,7 +135,8 @@ func TestSession_ShellCommand_PTY(t *testing.T) {
 
 	var out bytes.Buffer
 	res, err := sess.Shell(ShellOptions{
-		Argv:   []string{"sh", "-c", "test -t 0 && echo IS_TTY || echo NOT_TTY"},
+		Argv:   shellHelperArgv(t, "tty"),
+		Env:    map[string]string{shellHelperEnv: "1"},
 		PTY:    true,
 		Cols:   80,
 		Rows:   24,
@@ -99,7 +148,8 @@ func TestSession_ShellCommand_PTY(t *testing.T) {
 	if res.ExitCode != 0 {
 		t.Errorf("PTY exit code = %d, want 0", res.ExitCode)
 	}
-	if !strings.Contains(out.String(), "IS_TTY") {
-		t.Errorf("PTY stdout = %q, want to contain IS_TTY (pty not allocated?)", out.String())
+	want := "IS_TTY"
+	if !strings.Contains(out.String(), want) {
+		t.Errorf("PTY stdout = %q, want to contain %s", out.String(), want)
 	}
 }

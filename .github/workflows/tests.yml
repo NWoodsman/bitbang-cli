@@ -9,7 +9,10 @@ on:
 
 jobs:
   unit:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 5
 
     steps:
@@ -72,6 +75,8 @@ jobs:
           playwright install --with-deps chromium
 
       - name: Run E2E tests
+        env:
+          BITBANG_BIN: ${{ github.workspace }}/bitbangproxy
         run: python -m pytest tests/e2e/ -v --timeout=60 --timeout-method=thread --screenshot=only-on-failure --output=tests/e2e/screenshots
 
       - name: Upload screenshots on failure

@@ -1,4 +1,6 @@
 # Binary (root level only, not cmd/bitbangproxy/ source dir)
+/bitbang
+/bitbang.exe
 /bitbangproxy
 /bitbangproxy.exe
 /bitbangproxy-macos
@@ -6,6 +8,7 @@
 # Identity files
 .bitbang/
 
-# Python test cache
+# Test artifacts
+/.pytest_cache/
 __pycache__/
-tests/e2e/screenshots/
+/tests/e2e/screenshots/

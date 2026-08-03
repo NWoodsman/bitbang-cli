@@ -200,7 +200,7 @@ func registerSharedFlags(fs *flag.FlagSet, cfg *serveConfig) {
 // registerShellFlags wires the shell-specific flags. Used by both
 // `serve` (all-mode) and `serve shell` since both expose a shell.
 func registerShellFlags(fs *flag.FlagSet, cfg *serveConfig) {
-	fs.StringVar(&cfg.shellCmd, "shell-cmd", "", "Shell command to spawn (default: $SHELL or /bin/sh)")
+	fs.StringVar(&cfg.shellCmd, "shell-cmd", "", "Shell command to spawn (default: "+defaultShellLabel()+")")
 	fs.IntVar(&cfg.shellMaxSessions, "shell-max-sessions", 1, "Max concurrent shell sessions (0 = unlimited)")
 	fs.BoolVar(&cfg.shellMirror, "shell-mirror", true, "Mirror shell output to listener console")
 }
@@ -688,7 +688,7 @@ func printSharingBlock(cfg serveConfig, share *fileshare.FileShare) {
 		if cfg.shellCmd != "" {
 			shellLine += cfg.shellCmd
 		} else {
-			shellLine += "$SHELL or /bin/sh"
+			shellLine += defaultShellLabel()
 		}
 		if cfg.shellMaxSessions == 0 {
 			shellLine += ", unlimited concurrent sessions"

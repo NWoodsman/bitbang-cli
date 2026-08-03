@@ -51,10 +51,14 @@ def target_app():
 def proxy_url(target_app):
     """Start BitBangProxy targeting the local Flask app and return its URL."""
     repo_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-    proxy_bin = os.path.join(repo_dir, 'bitbangproxy')
+    default_name = 'bitbangproxy.exe' if os.name == 'nt' else 'bitbangproxy'
+    proxy_bin = os.environ.get('BITBANG_BIN', os.path.join(repo_dir, default_name))
 
     if not os.path.isfile(proxy_bin):
-        pytest.fail(f'BitBangProxy binary not found at {proxy_bin}. Run: go build -o bitbangproxy ./cmd/bitbang/')
+        pytest.fail(
+            f'BitBangProxy binary not found at {proxy_bin}. '
+            f'Run: go build -o {default_name} ./cmd/bitbang/'
+        )
 
     proc = subprocess.Popen(
         [proxy_bin, 'serve', 'proxy', '-server', TEST_SERVER, '-target', target_app, '-ephemeral'],
