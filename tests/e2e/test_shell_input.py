@@ -12,7 +12,7 @@ import threading
 import time
 
 import pytest
-from playwright.sync_api import expect, sync_playwright
+from playwright.sync_api import expect
 
 
 TEST_SERVER = os.environ.get("BITBANG_TEST_SERVER", "test.bitba.ng")
@@ -71,24 +71,28 @@ def shell_url():
         proc.kill()
 
 
-def test_browser_keystrokes_reach_shell(shell_url):
-    with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(headless=True)
-        page = browser.new_page()
-        try:
-            page.goto(shell_url, wait_until="domcontentloaded", timeout=30_000)
-            terminal = page.frame_locator("#device-frame").locator("#terminal")
-            textarea = terminal.locator("textarea.xterm-helper-textarea")
-            expect(textarea).to_be_attached(timeout=30_000)
-            textarea.focus()
+def test_browser_keystrokes_reach_shell(shell_url, playwright):
+    # Use pytest-playwright's session-scoped `playwright` fixture rather than
+    # calling sync_playwright() here. That fixture owns the event loop for the
+    # whole session, and the sync API refuses to start inside a running loop:
+    # creating our own passes when this file runs alone, and fails once any
+    # earlier test (test_post_body, test_proxy_page) has instantiated it.
+    browser = playwright.chromium.launch(headless=True)
+    page = browser.new_page()
+    try:
+        page.goto(shell_url, wait_until="domcontentloaded", timeout=30_000)
+        terminal = page.frame_locator("#device-frame").locator("#terminal")
+        textarea = terminal.locator("textarea.xterm-helper-textarea")
+        expect(textarea).to_be_attached(timeout=30_000)
+        textarea.focus()
 
-            marker = "BITBANG_BROWSER_INPUT_OK"
-            page.keyboard.type("echo " + marker)
-            page.keyboard.press("Enter")
-            page.keyboard.type("exit")
-            page.keyboard.press("Enter")
+        marker = "BITBANG_BROWSER_INPUT_OK"
+        page.keyboard.type("echo " + marker)
+        page.keyboard.press("Enter")
+        page.keyboard.type("exit")
+        page.keyboard.press("Enter")
 
-            expect(terminal).to_contain_text(marker, timeout=10_000)
-            expect(terminal).to_contain_text("[exit 0]", timeout=10_000)
-        finally:
-            browser.close()
+        expect(terminal).to_contain_text(marker, timeout=10_000)
+        expect(terminal).to_contain_text("[exit 0]", timeout=10_000)
+    finally:
+        browser.close()
