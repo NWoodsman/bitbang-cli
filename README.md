@@ -85,7 +85,7 @@ Every successful connect or pairing is saved to `~/.bitbang/devices.json`, so fr
 
 ## Install
 
-The one-liner detects your arch (`amd64`, `arm64`, `armv7`), downloads the binary from the latest [GitHub release](https://github.com/richlegrand/bitbang-cli/releases), verifies its SHA-256 against the release's `checksums.txt`, and installs to `~/.local/bin/bitbang`.
+The one-liner works on Linux and macOS. It detects your OS and arch (`amd64`, `arm64`, and `armv7` on Linux), downloads the binary from the latest [GitHub release](https://github.com/richlegrand/bitbang-cli/releases), verifies its SHA-256 against the release's `checksums.txt`, and installs to `~/.local/bin/bitbang`.
 
 Pin a version, change the location, or audit the script first:
 
@@ -98,8 +98,21 @@ curl -sSfL bitba.ng/install -o install.sh && less install.sh && sh install.sh
 
 Windows builds are published as `bitbang-windows-amd64.exe` and
 `bitbang-windows-arm64.exe`. Download the appropriate binary from Releases,
-rename it to `bitbang.exe`, and place it on your `PATH`. macOS builds are still
-pending. **Build from source:** see [below](#building-from-source).
+rename it to `bitbang.exe`, and place it on your `PATH`.
+**Build from source:** see [below](#building-from-source).
+
+**macOS and Gatekeeper.** The install one-liner above is unaffected: `curl` does
+not set the `com.apple.quarantine` attribute, so the binary it fetches runs
+normally. If you instead download `bitbang-darwin-arm64` from the Releases page
+in a browser, macOS quarantines it and refuses to open it, because the release
+binaries are not notarized. Clear it with either of:
+
+```
+xattr -d com.apple.quarantine ./bitbang-darwin-arm64
+```
+
+or right-click the file in Finder and choose Open, which offers a one-time
+override. Alternatively, build from source, which never quarantines.
 
 ### How the install URL works
 
@@ -125,14 +138,14 @@ How the two ends authenticate each other without trusting the signaling server i
 
 ## How it compares
 
-|                                 | ngrok         | Cloudflare Tunnel | Tailscale                | `bitbang`        |
-| ------------------------------- | ------------- | ----------------- | ------------------------ | ---------------- |
-| Account required                | Yes           | Yes               | Yes                      | **No**           |
-| Install on the connecting side  | No            | No                | **Yes**                  | **No** (browser) |
-| End-to-end encrypted            | Not by default | No               | Yes                      | **Yes**          |
-| Data path                       | Their servers | Their servers     | P2P                      | **P2P**          |
-| Self-hostable server (open source) | No         | No                | No (Headscale is third-party) | **Yes**     |
-| Setup before first use          | Account + authtoken | Account + DNS | Account + login on each device | **Run one command** |
+|                                    | ngrok               | Cloudflare Tunnel | Tailscale                      | frp                                 | `bitbang`           |
+| ---------------------------------- | ------------------- | ----------------- | ------------------------------ | ----------------------------------- | ------------------- |
+| Account required                   | Yes                 | Yes               | Yes                            | No                                  | **No**              |
+| Install on the connecting side     | No                  | No                | **Yes**                        | No (**Yes** for P2P mode)           | **No** (browser)    |
+| End-to-end encrypted               | Not by default      | No                | Yes                            | No -- your server sees traffic      | **Yes**             |
+| Data path                          | Their servers       | Their servers     | P2P                            | Your server (P2P optional)          | **P2P**             |
+| Self-hostable server (open source) | No                  | No                | No (Headscale is third-party)  | **Yes**                             | **Yes**             |
+| Setup before first use             | Account + authtoken | Account + DNS     | Account + login on each device | A public-IP server + TOML both ends | **Run one command** |
 
 
 ## Command reference

@@ -31,6 +31,18 @@ jobs:
           - os: windows
             goarch: arm64
             asset: bitbang-windows-arm64.exe
+          # Cross-compiled from ubuntu like the rest. The Go linker ad-hoc
+          # signs darwin/arm64 binaries itself, which is what lets an
+          # unsigned cross-build execute on Apple Silicon at all. Binaries
+          # fetched with curl carry no com.apple.quarantine attribute, so
+          # install.sh is unaffected by Gatekeeper; only browser downloads
+          # from the Releases page are, and the README covers that.
+          - os: darwin
+            goarch: arm64
+            asset: bitbang-darwin-arm64
+          - os: darwin
+            goarch: amd64
+            asset: bitbang-darwin-amd64
 
     steps:
       - uses: actions/checkout@v4
