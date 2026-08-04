@@ -348,10 +348,9 @@ Windows 10 version 1809 or Windows Server 2019 or later.
 
 ## Roadmap
 
-Shipping today: **shell, files, and proxy**, reachable from the browser or the CLI, plus scp-style file copy, **ad-hoc pairing** with a saved device table, and **terminal sharing** (`bitbang share`). Designed and on the way:
+Shipping today: **shell, files, and proxy**, reachable from the browser or the CLI, plus **TCP port forwarding**, scp-style file copy, **ad-hoc pairing** with a saved device table, and **terminal sharing** (`bitbang share`). Designed and on the way:
 
 - **Serial bridging** -- drive a remote `/dev/ttyUSB0` from a local virtual port (e.g. run Arduino IDE over the internet). An issue has been opened [here](https://github.com/richlegrand/bitbang-cli/issues/3).
-- **TCP port forwarding** -- `-L 5432:db.internal:5432` to reach LAN-only services. An issue has been opened [here](https://github.com/richlegrand/bitbang-cli/issues/4).
 - **Remote desktop** -- screen over a WebRTC video track, keyboard/mouse over the data channel.
 
 ## License
