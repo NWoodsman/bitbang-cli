@@ -47,15 +47,19 @@ type Session struct {
 	mu           sync.Mutex
 	streams      map[uint32]*stream
 	closed       atomic.Bool
+	done         chan struct{}
+	closeOnce    sync.Once
 }
 
 // stream is the per-stream state held by the session: an inbound frame
 // queue the caller drains via the public Inbox method. SYN/DAT/FIN
 // frames all arrive on the same channel — the caller inspects flags.
 type stream struct {
-	id    uint32
-	inbox chan protocol.Frame
-	once  sync.Once
+	id        uint32
+	inbox     chan protocol.Frame
+	abandoned chan struct{}
+	abandon   sync.Once
+	closeOnce sync.Once
 }
 
 // newSession constructs a Session bound to a data channel. The peer is
@@ -67,6 +71,7 @@ func newSession(p *Peer) *Session {
 		DC:           p.DC,
 		nextStreamID: 1,
 		streams:      make(map[uint32]*stream),
+		done:         make(chan struct{}),
 	}
 }
 
@@ -250,7 +255,17 @@ func (s *Session) handshake(p *Peer, path string, caps []string, pinPrompt func(
 // goroutine after handshake completes; exits when the DC closes.
 func (s *Session) startDispatcher(p *Peer) {
 	go func() {
-		for msg := range p.DCMessages() {
+		defer s.finishStreams()
+		for {
+			var msg []byte
+			select {
+			case <-s.done:
+				return
+			case <-p.DCClosed():
+				s.markClosed()
+				return
+			case msg = <-p.DCMessages():
+			}
 			frame, err := protocol.ParseFrame(msg)
 			if err != nil {
 				if s.Verbose {
@@ -275,24 +290,24 @@ func (s *Session) startDispatcher(p *Peer) {
 				}
 				continue
 			}
-			// Non-blocking send keeps the dispatcher responsive even if
-			// the consumer is slow; in practice callers consume eagerly.
-			st.inbox <- frame
+			// Delivery is lossless until the consumer explicitly abandons
+			// the stream or the session closes. The selects make a blocked
+			// delivery teardown-safe without racing a send against close.
+			select {
+			case st.inbox <- frame:
+			case <-st.abandoned:
+				continue
+			case <-p.DCClosed():
+				s.markClosed()
+				return
+			case <-s.done:
+				return
+			}
 			if frame.IsFIN() {
 				// FIN closes the stream's inbox so callers ranging over
 				// it see the channel close instead of blocking forever.
-				s.closeStream(st.id)
+				s.finishStream(st.id, st)
 			}
-		}
-	}()
-	go func() {
-		<-p.DCClosed()
-		s.closed.Store(true)
-		s.mu.Lock()
-		defer s.mu.Unlock()
-		for id, st := range s.streams {
-			st.once.Do(func() { close(st.inbox) })
-			delete(s.streams, id)
 		}
 	}()
 }
@@ -307,8 +322,9 @@ func (s *Session) OpenStream() *Stream {
 	// stream can use even IDs without an ID-allocation negotiation.
 	s.nextStreamID += 2
 	st := &stream{
-		id:    id,
-		inbox: make(chan protocol.Frame, 256),
+		id:        id,
+		inbox:     make(chan protocol.Frame, 256),
+		abandoned: make(chan struct{}),
 	}
 	s.streams[id] = st
 	s.mu.Unlock()
@@ -317,13 +333,45 @@ func (s *Session) OpenStream() *Stream {
 
 func (s *Session) closeStream(id uint32) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	st := s.streams[id]
-	if st == nil {
-		return
+	if st != nil {
+		delete(s.streams, id)
 	}
-	st.once.Do(func() { close(st.inbox) })
-	delete(s.streams, id)
+	s.mu.Unlock()
+	if st != nil {
+		st.abandon.Do(func() { close(st.abandoned) })
+	}
+}
+
+// finishStream is called only by the dispatcher, the sole inbox sender.
+func (s *Session) finishStream(id uint32, st *stream) {
+	s.mu.Lock()
+	if s.streams[id] == st {
+		delete(s.streams, id)
+	}
+	s.mu.Unlock()
+	st.closeOnce.Do(func() { close(st.inbox) })
+}
+
+func (s *Session) finishStreams() {
+	s.mu.Lock()
+	streams := make([]*stream, 0, len(s.streams))
+	for id, st := range s.streams {
+		streams = append(streams, st)
+		delete(s.streams, id)
+	}
+	s.mu.Unlock()
+	for _, st := range streams {
+		st.closeOnce.Do(func() { close(st.inbox) })
+	}
+	s.markClosed()
+}
+
+func (s *Session) markClosed() {
+	s.closeOnce.Do(func() {
+		s.closed.Store(true)
+		close(s.done)
+	})
 }
 
 func (s *Session) sendFrame(streamID uint32, flags uint16, payload []byte) error {
@@ -342,10 +390,14 @@ func (s *Session) sendControlSYN(payload []byte) error {
 // to the OS to reap when the process exits — pion's synchronous
 // PC.Close() path is slow on relay sessions and isn't worth waiting for.
 func (s *Session) Close() {
+	s.markClosed()
 	if s.DC != nil {
 		_ = s.DC.Close()
 	}
 }
+
+// Done closes when the data channel disconnects or Close is called.
+func (s *Session) Done() <-chan struct{} { return s.done }
 
 // Stream is the caller-facing handle for an outbound SWSP stream.
 type Stream struct {

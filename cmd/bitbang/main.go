@@ -4,17 +4,18 @@
 //
 // Usage:
 //
-//	bitbang serve                                 # all caps: shell + files + proxy
-//	bitbang serve shell [flags]                   # shell only
+//	bitbang serve                                 # all caps: shell + files + proxy + TCP
+//	bitbang serve shell [flags]                   # shell + TCP forwarding
 //	bitbang serve files [PATH] [flags]            # files only, PATH defaults to cwd
 //	bitbang serve proxy [flags]                   # proxy only (HTTP reverse proxy)
 //	bitbang share [flags]                         # publish the current tmux session
 //	bitbang share status|stop|rotate              # manage a running share
 //	bitbang cp <src> <dst>                        (one side is <URL>:/path, or `-`)
-//	bitbang connect <URL> [-- argv]               (client: interactive or one-shot)
+//	bitbang connect <URL> [-- argv]               # shell or command
+//	bitbang connect <URL> -L port:host:port       # forwarding only
 //
 // `bitbang serve` is the umbrella mode — its default cap set (today:
-// shell + files + proxy) is what most users want, and the hamburger
+// shell + files + proxy + TCP) is what most users want, and the hamburger
 // menu on the launcher tab is how they pick which cap to open.
 // Single-cap modes are for when you specifically want to expose just
 // one capability and skip the hamburger UI entirely.
@@ -29,7 +30,7 @@ import (
 	"os"
 )
 
-const version = "0.4.7"
+const version = "0.5.0-dev"
 
 const banner = `   ___         ___
   / __\_ _    / __\
@@ -91,14 +92,16 @@ func dispatchServe(args []string) {
 func printUsage() {
 	fmt.Printf("%s v%s\n\n", banner, version)
 	fmt.Println("Usage:")
-	fmt.Println("  bitbang serve [flags]                  All caps (shell + files + proxy)")
-	fmt.Println("  bitbang serve shell [flags]            Shell only")
+	fmt.Println("  bitbang serve [flags]                  All caps (shell + files + proxy + TCP)")
+	fmt.Println("  bitbang serve shell [flags]            Shell + CLI TCP forwarding")
 	fmt.Println("  bitbang serve files [PATH] [flags]     Files only (PATH defaults to cwd)")
 	fmt.Println("  bitbang serve proxy [flags]            Proxy only (HTTP reverse proxy)")
 	fmt.Println("  bitbang share [flags]                  Publish the current tmux session as a URL")
 	fmt.Println("  bitbang share status|stop|rotate       Manage a running share")
 	fmt.Println("  bitbang cp <src> <dst>                 Copy files (one side is <URL>:/path, or '-')")
-	fmt.Println("  bitbang connect <URL-or-code> [-- ...]  Open shell, or pair via 6-digit code")
+	fmt.Println("  bitbang connect <URL-or-code> [-- ...]  Open a shell or run a command")
+	fmt.Println("  bitbang connect <URL-or-code> -L port:host:port [-L ...] [-g]")
+	fmt.Println("                                             Hold local TCP forwards without a shell")
 	fmt.Println()
 	fmt.Println("Run a command with `--help` for its available flags.")
 }

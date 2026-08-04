@@ -1,5 +1,5 @@
-// Package protocol implements SWSP (Simple WebRTC Streaming Protocol) for
-// HTTP over WebRTC data channels.
+// Package protocol implements SWSP (Simple WebRTC Streaming Protocol) over
+// WebRTC data channels.
 //
 // Frame format (8-byte header + payload):
 //
@@ -89,6 +89,13 @@ type FileOp struct {
 	Range     []int64 `json:"range,omitempty"`     // for get: [start, end] inclusive byte range
 }
 
+// TCPOpen is the JSON metadata for a raw TCP-stream SYN frame (SWSP v3).
+type TCPOpen struct {
+	Type string `json:"type"`
+	Host string `json:"host"`
+	Port int    `json:"port"`
+}
+
 // ParseFrame parses a raw SWSP frame from bytes.
 func ParseFrame(data []byte) (Frame, error) {
 	if len(data) < HeaderSize {
@@ -148,4 +155,3 @@ func ParseRequest(payload []byte) (Request, error) {
 	}
 	return req, nil
 }
-

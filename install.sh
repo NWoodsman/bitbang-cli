@@ -7,8 +7,8 @@
 # Common invocation:
 #   curl -sSfL bitba.ng/install | sh
 #
-# Pinning a version or changing the install prefix:
-#   curl -sSfL bitba.ng/install | sh -s -- --version v0.5.0
+# Pinning a version or changing the install prefix (tags carry no "v" prefix):
+#   curl -sSfL bitba.ng/install | sh -s -- --version 0.5.0
 #   curl -sSfL bitba.ng/install | sh -s -- --prefix /usr/local/bin
 #
 # Audit-first variant (recommended in shared environments):
@@ -179,10 +179,10 @@ Windows binaries are published too, but must be installed by hand from
 https://github.com/${REPO}/releases
 
 Usage:
-  install.sh [--version vX.Y.Z] [--prefix DIR]
+  install.sh [--version X.Y.Z] [--prefix DIR]
 
 Options:
-  --version VER   install a specific release tag (default: latest)
+  --version VER   install a specific release tag, e.g. 0.5.0 (default: latest)
   --prefix DIR    install to DIR (default: ${DEFAULT_PREFIX})
   -h, --help      show this help
 EOF
