@@ -81,7 +81,8 @@ type Peer struct {
 	dcReady chan struct{}
 
 	// dcMsg is the queue of inbound data-channel messages, drained by the
-	// session layer. Buffered so the read goroutine never blocks.
+	// session layer. Delivery is lossless while the channel is live; a full
+	// queue applies backpressure instead of silently dropping stream bytes.
 	dcMsg chan []byte
 
 	// dcClosed fires once the data channel transitions to closed. Used so
@@ -146,11 +147,7 @@ func (p *Peer) onDataChannel(dc *webrtc.DataChannel) {
 	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
 		select {
 		case p.dcMsg <- msg.Data:
-		default:
-			// Drop on full queue. 64 buffered frames is plenty for the
-			// control / handshake phase; once the session is up the
-			// consumer drains as fast as frames arrive. A miss here would
-			// indicate the session goroutine is stuck.
+		case <-p.dcClosed:
 		}
 	})
 
