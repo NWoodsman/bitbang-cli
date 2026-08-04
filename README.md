@@ -87,16 +87,11 @@ Every successful connect or pairing is saved to `~/.bitbang/devices.json`, so fr
 
 ## Install
 
-The one-liner works on Linux and macOS. It detects your OS and arch (`amd64`, `arm64`, and `armv7` on Linux), downloads the binary from the latest [GitHub release](https://github.com/richlegrand/bitbang-cli/releases), verifies its SHA-256 against the release's `checksums.txt`, and installs to `~/.local/bin/bitbang`.
-
-Pin a version, change the location, or audit the script first:
-
 ```
-curl -sSfL bitba.ng/install | sh -s -- --version v0.5.0
-curl -sSfL bitba.ng/install | sh -s -- --prefix /usr/local/bin
-
-curl -sSfL bitba.ng/install -o install.sh && less install.sh && sh install.sh
+curl -sSfL bitba.ng/install | sh
 ```
+
+Linux and macOS. Detects your OS and arch (`amd64`, `arm64`, and `armv7` on Linux), downloads the binary from the latest [GitHub release](https://github.com/richlegrand/bitbang-cli/releases), verifies its SHA-256 against the release's `checksums.txt`, and installs to `~/.local/bin/bitbang`.
 
 Windows builds are published as `bitbang-windows-amd64.exe` and
 `bitbang-windows-arm64.exe`. Download the appropriate binary from Releases,
@@ -115,6 +110,19 @@ xattr -d com.apple.quarantine ./bitbang-darwin-arm64
 
 or right-click the file in Finder and choose Open, which offers a one-time
 override. Alternatively, build from source, which never quarantines.
+
+### Install options
+
+Pin a version, change the location, or read the script before running it:
+
+```
+curl -sSfL bitba.ng/install | sh -s -- --version 0.5.0
+curl -sSfL bitba.ng/install | sh -s -- --prefix /usr/local/bin
+
+curl -sSfL bitba.ng/install -o install.sh && less install.sh && sh install.sh
+```
+
+Release tags have no `v` prefix (`0.5.0`, not `v0.5.0`).
 
 ### How the install URL works
 
