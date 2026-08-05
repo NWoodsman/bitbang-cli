@@ -1,0 +1,201 @@
+package fileshare
+
+import (
+	"io"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"testing"
+)
+
+// share builds a browse-mode share rooted at dir.
+func share(dir string, upload bool) *FileShare {
+	return &FileShare{BasePath: dir, Mode: ModeBrowse, UploadEnabled: upload}
+}
+
+// outside creates a sibling directory holding a secret file, plus the share
+// root itself. Returned as (shareDir, outsideDir).
+func outside(t *testing.T) (string, string) {
+	t.Helper()
+	root := t.TempDir()
+	shareDir := filepath.Join(root, "share")
+	outsideDir := filepath.Join(root, "outside")
+	for _, d := range []string{shareDir, outsideDir} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(outsideDir, "secret.txt"), []byte("secret"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return shareDir, outsideDir
+}
+
+func symlink(t *testing.T, target, link string) {
+	t.Helper()
+	if err := os.Symlink(target, link); err != nil {
+		if runtime.GOOS == "windows" {
+			t.Skip("symlinks require elevation on Windows")
+		}
+		t.Fatal(err)
+	}
+}
+
+func TestSafePathRejectsSymlinkedFile(t *testing.T) {
+	shareDir, outsideDir := outside(t)
+	symlink(t, filepath.Join(outsideDir, "secret.txt"), filepath.Join(shareDir, "link.txt"))
+
+	if got := SafePath(shareDir, "link.txt"); got != "" {
+		t.Errorf("SafePath followed a symlink out of the share: %q", got)
+	}
+}
+
+func TestSafePathRejectsSymlinkedDir(t *testing.T) {
+	shareDir, outsideDir := outside(t)
+	symlink(t, outsideDir, filepath.Join(shareDir, "link"))
+
+	if got := SafePath(shareDir, "link/secret.txt"); got != "" {
+		t.Errorf("SafePath read through a directory symlink: %q", got)
+	}
+	if got := SafePath(shareDir, "link"); got != "" {
+		t.Errorf("SafePath accepted a directory symlink pointing outside: %q", got)
+	}
+}
+
+// The share root being a symlink is legitimate and common -- macOS /tmp is a
+// symlink to /private/tmp. Resolving the requested path but not the base
+// makes every such share reject everything, which is the standard way this
+// fix ships broken.
+func TestSafePathAllowsSymlinkedBase(t *testing.T) {
+	root := t.TempDir()
+	real := filepath.Join(root, "real")
+	if err := os.MkdirAll(real, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(real, "ok.txt"), []byte("hi"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "link")
+	symlink(t, real, link)
+
+	got := SafePath(link, "ok.txt")
+	if got == "" {
+		t.Fatal("SafePath rejected a file in a share whose root is a symlink")
+	}
+	if !strings.HasSuffix(got, "ok.txt") {
+		t.Errorf("unexpected path %q", got)
+	}
+	if SafePath(link, "") == "" {
+		t.Error("SafePath rejected the share root itself when it is a symlink")
+	}
+}
+
+func TestSafePathStillRejectsTraversal(t *testing.T) {
+	shareDir, _ := outside(t)
+	for _, p := range []string{"../outside/secret.txt", "..", "a/../../outside/secret.txt"} {
+		if got := SafePath(shareDir, p); got != "" {
+			t.Errorf("SafePath(%q) = %q, want rejection", p, got)
+		}
+	}
+}
+
+func TestSafePathAllowsOrdinaryFile(t *testing.T) {
+	shareDir, _ := outside(t)
+	if err := os.WriteFile(filepath.Join(shareDir, "a.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if SafePath(shareDir, "a.txt") == "" {
+		t.Error("SafePath rejected an ordinary file inside the share")
+	}
+}
+
+func TestOpenWriteRejectsSymlinkedDir(t *testing.T) {
+	shareDir, outsideDir := outside(t)
+	symlink(t, outsideDir, filepath.Join(shareDir, "link"))
+
+	f := share(shareDir, true)
+	w, err := f.OpenWrite("link/planted.txt", true)
+	if err == nil {
+		w.Close()
+		t.Fatal("OpenWrite created a file through a directory symlink")
+	}
+	if _, statErr := os.Stat(filepath.Join(outsideDir, "planted.txt")); statErr == nil {
+		t.Fatal("a file was written outside the share")
+	}
+}
+
+// An existing symlink under the share is the other write escape: the parent
+// is legitimately inside, but os.Create follows the final component.
+func TestOpenWriteRejectsExistingSymlinkTarget(t *testing.T) {
+	shareDir, outsideDir := outside(t)
+	victim := filepath.Join(outsideDir, "victim.txt")
+	if err := os.WriteFile(victim, []byte("original"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	symlink(t, victim, filepath.Join(shareDir, "innocent.txt"))
+
+	f := share(shareDir, true)
+	w, err := f.OpenWrite("innocent.txt", true)
+	if err == nil {
+		w.Close()
+		t.Fatal("OpenWrite followed a symlink out of the share")
+	}
+	got, err := os.ReadFile(victim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "original" {
+		t.Fatalf("file outside the share was overwritten: %q", got)
+	}
+}
+
+func TestOpenWriteAllowsOrdinaryNewFile(t *testing.T) {
+	shareDir, _ := outside(t)
+	f := share(shareDir, true)
+	w, err := f.OpenWrite("new.txt", true)
+	if err != nil {
+		t.Fatalf("OpenWrite rejected an ordinary new file: %v", err)
+	}
+	if _, err := io.WriteString(w, "data"); err != nil {
+		t.Fatal(err)
+	}
+	w.Close()
+	if _, err := os.Stat(filepath.Join(shareDir, "new.txt")); err != nil {
+		t.Fatalf("file was not created: %v", err)
+	}
+}
+
+// Hiding an entry from the listing is not a read control unless the read
+// paths enforce it too.
+func TestReadPathsEnforceShouldShow(t *testing.T) {
+	shareDir, _ := outside(t)
+	if err := os.WriteFile(filepath.Join(shareDir, ".env"), []byte("SECRET=1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitDir := filepath.Join(shareDir, ".git")
+	if err := os.MkdirAll(gitDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(gitDir, "config"), []byte("[core]"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	f := share(shareDir, false)
+	for _, p := range []string{".env", ".git/config", ".git"} {
+		if _, _, err := f.OpenRead(p); err == nil {
+			t.Errorf("OpenRead(%q) succeeded; hidden entries must not be readable by path", p)
+		}
+		if _, err := f.StatPath(p); err == nil {
+			t.Errorf("StatPath(%q) succeeded; hidden entries must not be stat-able by path", p)
+		}
+	}
+
+	// A normal file in the same share is unaffected.
+	if err := os.WriteFile(filepath.Join(shareDir, "visible.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := f.OpenRead("visible.txt"); err != nil {
+		t.Errorf("OpenRead rejected an ordinary file: %v", err)
+	}
+}
