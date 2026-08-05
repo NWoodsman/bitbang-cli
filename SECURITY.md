@@ -66,7 +66,7 @@ traffic or insert itself into it. Anything that breaks that is in scope.
 For issues in the signaling server or the browser runtime, please report against
 [bitbang-server](https://github.com/richlegrand/bitbang-server) instead. The browser
 runtime has a weaker guarantee than the installed clients, and that boundary is documented
-in the [security claims](https://github.com/richlegrand/bitbang) writeup.
+in [*Trustless Signaling*](https://github.com/richlegrand/bitbang/blob/main/trustless-signaling.md).
 
 ## Supported versions
 
