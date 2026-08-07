@@ -3,6 +3,7 @@ package session
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -210,7 +211,7 @@ func TestSlowStreamDoesNotBlockAnotherStream(t *testing.T) {
 	})
 }
 
-func TestV4SenderWaitsForCumulativeCredit(t *testing.T) {
+func TestV4SenderUsesImplicitInitialCreditAndWaitsForUpdate(t *testing.T) {
 	streamReady := make(chan streamtype.Stream, 1)
 	handler := &testHandler{onSYN: func(s streamtype.Stream, _ []byte, _ bool) error {
 		streamReady <- s
@@ -219,23 +220,46 @@ func TestV4SenderWaitsForCumulativeCredit(t *testing.T) {
 	sess, capture := newFlowTestSession(t, 4, handler)
 	openTestStream(sess, 1, false)
 	stream := <-streamReady
-	waitFor(t, func() bool { return len(capture.controls(protocol.ControlWindowUpdate)) == 1 })
+	if updates := capture.controls(protocol.ControlWindowUpdate); len(updates) != 0 {
+		t.Fatalf("v4 SYN sent redundant initial window update: %#v", updates)
+	}
+
+	payload := make([]byte, protocol.MaxChunkSize)
+	frames := protocol.InitialStreamWindow / protocol.MaxChunkSize
+	fillDone := make(chan error, 1)
+	go func() {
+		for i := 0; i < frames; i++ {
+			if err := stream.WriteDAT(payload); err != nil {
+				fillDone <- fmt.Errorf("write implicit window frame %d: %w", i, err)
+				return
+			}
+		}
+		fillDone <- nil
+	}()
+	select {
+	case err := <-fillDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("implicit initial window did not become sendable")
+	}
 
 	writeDone := make(chan error, 1)
 	go func() { writeDone <- stream.WriteDAT([]byte("x")) }()
 	select {
 	case err := <-writeDone:
-		t.Fatalf("write completed before credit: %v", err)
+		t.Fatalf("write beyond implicit window completed early: %v", err)
 	case <-time.After(30 * time.Millisecond):
 	}
-	if got := capture.countData(1); got != 0 {
-		t.Fatalf("sent %d data frames before credit, want 0", got)
+	if got := capture.countData(1); got != frames {
+		t.Fatalf("sent %d data frames before update, want %d", got, frames)
 	}
 
 	sendControl(sess, protocol.WindowUpdate{
 		Type:     protocol.ControlWindowUpdate,
 		StreamID: 1,
-		MaxBytes: 1,
+		MaxBytes: protocol.InitialStreamWindow + 1,
 	})
 	select {
 	case err := <-writeDone:
@@ -245,8 +269,8 @@ func TestV4SenderWaitsForCumulativeCredit(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("write did not resume after credit")
 	}
-	if got := capture.countData(1); got != 1 {
-		t.Fatalf("sent %d data frames after credit, want 1", got)
+	if got := capture.countData(1); got != frames+1 {
+		t.Fatalf("sent %d data frames after update, want %d", got, frames+1)
 	}
 }
 
@@ -256,13 +280,9 @@ func TestStreamResetFollowsAlreadyReservedData(t *testing.T) {
 		streamReady <- s
 		return nil
 	}}
-	sess, capture := newFlowTestSession(t, 4, handler)
+	sess, _ := newFlowTestSession(t, 4, handler)
 	openTestStream(sess, 1, false)
 	stream := <-streamReady
-	waitFor(t, func() bool { return len(capture.controls(protocol.ControlWindowUpdate)) == 1 })
-	sendControl(sess, protocol.WindowUpdate{
-		Type: protocol.ControlWindowUpdate, StreamID: 1, MaxBytes: 1,
-	})
 
 	sess.mu.Lock()
 	st := sess.streams[1]
@@ -380,7 +400,9 @@ func TestV4ReceiveWindowViolationResetsOnlyOffendingStream(t *testing.T) {
 	sess, capture := newFlowTestSession(t, 4, handler)
 	openTestStream(sess, 1, false)
 	openTestStream(sess, 3, false)
-	waitFor(t, func() bool { return len(capture.controls(protocol.ControlWindowUpdate)) == 2 })
+	if updates := capture.controls(protocol.ControlWindowUpdate); len(updates) != 0 {
+		t.Fatalf("v4 SYNs sent redundant initial window updates: %#v", updates)
+	}
 
 	payload := make([]byte, protocol.MaxChunkSize)
 	sess.HandleMessage(protocol.BuildFrame(1, protocol.FlagDAT, payload))
@@ -404,9 +426,10 @@ func TestV4ReceiveWindowViolationResetsOnlyOffendingStream(t *testing.T) {
 	}
 }
 
-func TestV4ReceiverGrantsNoDataBeforeSYNIsRouted(t *testing.T) {
+func TestV4ReceiverQueuesImplicitWindowDataBehindSYN(t *testing.T) {
 	synStarted := make(chan struct{})
 	releaseSYN := make(chan struct{})
+	dataDelivered := make(chan struct{})
 	var startOnce, releaseOnce sync.Once
 	handler := &testHandler{
 		onSYN: func(streamtype.Stream, []byte, bool) error {
@@ -417,6 +440,10 @@ func TestV4ReceiverGrantsNoDataBeforeSYNIsRouted(t *testing.T) {
 		onReset: func(streamtype.Stream, string, string) {
 			releaseOnce.Do(func() { close(releaseSYN) })
 		},
+		onDAT: func(streamtype.Stream, []byte) error {
+			close(dataDelivered)
+			return nil
+		},
 	}
 	sess, capture := newFlowTestSession(t, 4, handler)
 	openTestStream(sess, 1, false)
@@ -426,12 +453,25 @@ func TestV4ReceiverGrantsNoDataBeforeSYNIsRouted(t *testing.T) {
 		t.Fatal("SYN handler did not start")
 	}
 
-	// A v4 sender starts at zero credit. Data sent before the listener has
-	// routed SYN and advertised its first window is a stream-local violation.
+	// The initial window is implicit, so ordered DAT can queue while OnSYN is
+	// still running. The worker must not deliver it ahead of SYN.
 	sess.HandleMessage(protocol.BuildFrame(1, protocol.FlagDAT, []byte{1}))
-	waitFor(t, func() bool { return len(capture.controls(protocol.ControlStreamReset)) == 1 })
+	select {
+	case <-dataDelivered:
+		t.Fatal("DAT overtook the blocked SYN handler")
+	case <-time.After(30 * time.Millisecond):
+	}
+	if resets := capture.controls(protocol.ControlStreamReset); len(resets) != 0 {
+		t.Fatalf("implicit-window DAT reset the stream: %#v", resets)
+	}
 	if updates := capture.controls(protocol.ControlWindowUpdate); len(updates) != 0 {
-		t.Fatalf("sent %d window updates before SYN routing completed", len(updates))
+		t.Fatalf("v4 SYN sent redundant initial window update: %#v", updates)
+	}
+	releaseOnce.Do(func() { close(releaseSYN) })
+	select {
+	case <-dataDelivered:
+	case <-time.After(time.Second):
+		t.Fatal("queued DAT was not delivered after SYN completed")
 	}
 }
 
@@ -443,16 +483,18 @@ func TestConsumedBytesReplenishWindow(t *testing.T) {
 	}}
 	sess, capture := newFlowTestSession(t, 4, handler)
 	openTestStream(sess, 1, false)
-	waitFor(t, func() bool { return len(capture.controls(protocol.ControlWindowUpdate)) == 1 })
+	if updates := capture.controls(protocol.ControlWindowUpdate); len(updates) != 0 {
+		t.Fatalf("v4 SYN sent redundant initial window update: %#v", updates)
+	}
 
 	payload := make([]byte, protocol.MaxChunkSize)
 	for i := 0; i < protocol.StreamWindowUpdateThreshold/protocol.MaxChunkSize; i++ {
 		sess.HandleMessage(protocol.BuildFrame(1, protocol.FlagDAT, payload))
 	}
-	waitFor(t, func() bool { return len(capture.controls(protocol.ControlWindowUpdate)) == 2 })
+	waitFor(t, func() bool { return len(capture.controls(protocol.ControlWindowUpdate)) == 1 })
 	updates := capture.controls(protocol.ControlWindowUpdate)
 	want := float64(protocol.InitialStreamWindow + protocol.StreamWindowUpdateThreshold)
-	if got := updates[1]["max_bytes"]; got != want {
+	if got := updates[0]["max_bytes"]; got != want {
 		t.Fatalf("replenished max_bytes = %v, want %.0f", got, want)
 	}
 	if got := consumed.Load(); got != protocol.StreamWindowUpdateThreshold {
@@ -486,6 +528,12 @@ func TestResetAndSessionCloseWakeBlockedWriters(t *testing.T) {
 			sess, _ := newFlowTestSession(t, 4, handler)
 			openTestStream(sess, 1, false)
 			stream := <-streamReady
+			sess.mu.Lock()
+			st := sess.streams[1]
+			sess.mu.Unlock()
+			if err := st.reserveSend(protocol.InitialStreamWindow, sess.done); err != nil {
+				t.Fatalf("reserve implicit initial window: %v", err)
+			}
 			writeDone := make(chan error, 1)
 			go func() { writeDone <- stream.WriteDAT([]byte("blocked")) }()
 			select {

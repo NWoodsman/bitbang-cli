@@ -69,6 +69,12 @@ func newStreamState(id uint32, handler streamtype.StreamHandler, flow bool) *str
 		done:     make(chan struct{}),
 		sendWake: make(chan struct{}),
 	}
+	if flow {
+		// The v4 SYN opens both directions with the protocol's implicit
+		// initial window; no window_update round trip is required.
+		st.advertised = protocol.InitialStreamWindow
+		st.sendMax = protocol.InitialStreamWindow
+	}
 	return st
 }
 

@@ -82,6 +82,94 @@ func TestSessionV3DataPathDoesNotUseCredit(t *testing.T) {
 	}
 }
 
+func TestSessionV4DataUsesImplicitInitialWindow(t *testing.T) {
+	p, sess := newDispatchTestSession(t, 1)
+	sess.NegotiatedVersion = 4
+	sent := make(chan protocol.Frame, 3)
+	sess.sendFrameOverride = func(streamID uint32, flags uint16, payload []byte) error {
+		sent <- protocol.Frame{StreamID: streamID, Flags: flags, Payload: append([]byte(nil), payload...)}
+		return nil
+	}
+	stream := sess.OpenStream()
+	sess.startDispatcher(p)
+	writeDone := make(chan error, 1)
+	go func() { writeDone <- stream.WriteSYN([]byte(`{"type":"test"}`)) }()
+	if err := waitResult(t, writeDone); err != nil {
+		t.Fatalf("v4 WriteSYN: %v", err)
+	}
+	go func() { writeDone <- stream.WriteDAT([]byte("request")) }()
+	if err := waitResult(t, writeDone); err != nil {
+		t.Fatalf("v4 first WriteDAT: %v", err)
+	}
+
+	for i := 0; i < 2; i++ {
+		select {
+		case frame := <-sent:
+			if frame.StreamID != stream.ID() {
+				t.Fatalf("v4 sent initial control frame: %#v", frame)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for v4 stream frame")
+		}
+	}
+	select {
+	case frame := <-sent:
+		t.Fatalf("v4 sent redundant initial control frame: %#v", frame)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	p.dcMsg <- protocol.BuildFrame(stream.ID(), protocol.FlagDAT, []byte("response"))
+	select {
+	case frame := <-stream.Inbox():
+		if got := string(frame.Payload); got != "response" {
+			t.Fatalf("v4 immediate response = %q, want response", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("v4 immediate response was not accepted")
+	}
+}
+
+func TestSessionV4RejectsDataBeforeSYN(t *testing.T) {
+	_, sess := newDispatchTestSession(t, 1)
+	sess.NegotiatedVersion = 4
+	sent := make(chan protocol.Frame, 1)
+	sess.sendFrameOverride = func(streamID uint32, flags uint16, payload []byte) error {
+		sent <- protocol.Frame{StreamID: streamID, Flags: flags, Payload: append([]byte(nil), payload...)}
+		return nil
+	}
+	stream := sess.OpenStream()
+
+	if err := stream.WriteDAT([]byte("early")); !errors.Is(err, errStreamNotStarted) {
+		t.Fatalf("pre-SYN WriteDAT error = %v, want %v", err, errStreamNotStarted)
+	}
+	frame := protocol.Frame{StreamID: stream.ID(), Payload: []byte("early")}
+	if err := stream.st.enqueue(frame, true); !errors.Is(err, errStreamNotStarted) {
+		t.Fatalf("pre-SYN inbound DAT error = %v, want %v", err, errStreamNotStarted)
+	}
+	select {
+	case frame := <-sent:
+		t.Fatalf("pre-SYN WriteDAT sent frame %#v", frame)
+	case <-time.After(20 * time.Millisecond):
+	}
+}
+
+func TestSessionFailedV4SYNClosesStream(t *testing.T) {
+	_, sess := newDispatchTestSession(t, 1)
+	sess.NegotiatedVersion = 4
+	sess.sendFrameOverride = func(uint32, uint16, []byte) error {
+		return errors.New("send failed")
+	}
+	stream := sess.OpenStream()
+
+	if err := stream.WriteSYN([]byte(`{"type":"test"}`)); err == nil || err.Error() != "send failed" {
+		t.Fatalf("failed SYN error = %v, want send failed", err)
+	}
+	if got := sess.findStream(stream.ID()); got != nil {
+		t.Fatal("failed SYN left stream registered")
+	}
+	waitInboxClosed(t, stream.Inbox())
+}
+
 func TestSessionOversizedWriteFailsBeforeCreditWait(t *testing.T) {
 	_, sess := newDispatchTestSession(t, 1)
 	sess.NegotiatedVersion = 4
@@ -157,8 +245,9 @@ func TestSessionQueueOverflowClosesOnlyOffendingStream(t *testing.T) {
 
 func TestSessionReceiveQueueHasByteLimit(t *testing.T) {
 	_, sess := newDispatchTestSession(t, 1)
+	sess.NegotiatedVersion = 4
 	st := sess.OpenStream().st
-	st.prepareInitialWindow()
+	st.activateInitialWindow()
 
 	frame := protocol.Frame{StreamID: st.id, Payload: make([]byte, protocol.MaxChunkSize)}
 	for i := 0; i < protocol.InitialStreamWindow/protocol.MaxChunkSize; i++ {
@@ -194,7 +283,7 @@ func TestSessionFINKeepsOppositeDirectionRoutable(t *testing.T) {
 	p, sess := newDispatchTestSession(t, 1)
 	sess.NegotiatedVersion = 4
 	stream := sess.OpenStream()
-	stream.st.prepareInitialWindow()
+	stream.st.activateInitialWindow()
 	sess.startDispatcher(p)
 
 	p.dcMsg <- protocol.BuildFrame(stream.ID(), protocol.FlagFIN, nil)
@@ -229,9 +318,12 @@ func TestSessionDataAfterFINResetsOnlyOffendingStream(t *testing.T) {
 		return nil
 	}
 	stream := sess.OpenStream()
-	stream.st.prepareInitialWindow()
+	stream.st.activateInitialWindow()
 	sess.startDispatcher(p)
 
+	if err := stream.st.reserveSend(protocol.InitialStreamWindow, sess.Done()); err != nil {
+		t.Fatalf("reserve implicit initial window: %v", err)
+	}
 	blockedSend := make(chan error, 1)
 	go func() { blockedSend <- stream.st.reserveSend(1, sess.Done()) }()
 	assertBlocked(t, blockedSend)
@@ -266,7 +358,7 @@ func TestSessionOwnsStreamUntilQueuedFINIsDelivered(t *testing.T) {
 	sess.NegotiatedVersion = 4
 	sess.sendFrameOverride = func(uint32, uint16, []byte) error { return nil }
 	stream := sess.OpenStream()
-	stream.st.prepareInitialWindow()
+	stream.st.activateInitialWindow()
 	sess.startDispatcher(p)
 
 	// Leave the public inbox unread so the delivery worker is blocked on the
@@ -293,21 +385,19 @@ func TestSessionOwnsStreamUntilQueuedFINIsDelivered(t *testing.T) {
 
 func TestStreamSendCreditIsCumulativeAndTeardownSafe(t *testing.T) {
 	_, sess := newDispatchTestSession(t, 1)
+	sess.NegotiatedVersion = 4
 	st := sess.OpenStream().st
+	st.activateInitialWindow()
 
-	result := make(chan error, 1)
-	go func() { result <- st.reserveSend(10, sess.Done()) }()
-	assertBlocked(t, result)
-
-	st.updateSendLimit(10)
-	if err := waitResult(t, result); err != nil {
-		t.Fatalf("reserve initial credit: %v", err)
+	if err := st.reserveSend(protocol.InitialStreamWindow, sess.Done()); err != nil {
+		t.Fatalf("reserve implicit initial credit: %v", err)
 	}
 
+	result := make(chan error, 1)
 	go func() { result <- st.reserveSend(1, sess.Done()) }()
-	st.updateSendLimit(5) // stale update must not reduce or replenish credit
+	st.updateSendLimit(protocol.InitialStreamWindow - 1) // stale update must not reduce credit
 	assertBlocked(t, result)
-	st.updateSendLimit(11)
+	st.updateSendLimit(protocol.InitialStreamWindow + 1)
 	if err := waitResult(t, result); err != nil {
 		t.Fatalf("reserve replenished credit: %v", err)
 	}
@@ -324,16 +414,17 @@ func TestSessionHandlesWindowUpdateAndStreamReset(t *testing.T) {
 	_, sess := newDispatchTestSession(t, 1)
 	sess.NegotiatedVersion = 4
 	stream := sess.OpenStream()
+	stream.st.activateInitialWindow()
 
 	update, _ := json.Marshal(protocol.WindowUpdate{
 		Type:     protocol.ControlWindowUpdate,
 		StreamID: stream.ID(),
-		MaxBytes: 123,
+		MaxBytes: protocol.InitialStreamWindow + 123,
 	})
 	if !sess.handleControl(protocol.Frame{StreamID: 0, Flags: protocol.FlagSYN, Payload: update}) {
 		t.Fatal("window update was not handled")
 	}
-	if err := stream.st.reserveSend(123, sess.Done()); err != nil {
+	if err := stream.st.reserveSend(protocol.InitialStreamWindow+123, sess.Done()); err != nil {
 		t.Fatalf("reserve updated window: %v", err)
 	}
 
@@ -461,7 +552,7 @@ func TestStreamResetFollowsAlreadyReservedData(t *testing.T) {
 	_, sess := newDispatchTestSession(t, 1)
 	sess.NegotiatedVersion = 4
 	stream := sess.OpenStream()
-	stream.st.updateSendLimit(1)
+	stream.st.activateInitialWindow()
 
 	dataStarted := make(chan struct{})
 	releaseData := make(chan struct{})

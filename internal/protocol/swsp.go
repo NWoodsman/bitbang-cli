@@ -42,9 +42,12 @@ const (
 	// v4 adds negotiated per-stream flow control and stream-local resets.
 	SWSPVersion = 4
 
-	// Flow-control defaults are deliberately per stream. Keeping the update
-	// threshold below the window lets a sender continue while the next
-	// cumulative grant is in flight.
+	// Flow-control defaults are deliberately per stream. A v4 SYN implicitly
+	// grants the initial window in both directions; later window updates raise
+	// that cumulative limit. Keeping the update threshold below the window lets
+	// a sender continue while the next grant is in flight. The frame limit
+	// separately bounds queue work for tiny or empty frames that consume little
+	// or no byte credit.
 	InitialStreamWindow         = 1 << 20
 	StreamWindowUpdateThreshold = InitialStreamWindow / 2
 	MaxQueuedStreamFrames       = 256

@@ -23,6 +23,7 @@ var (
 	errReceiveWindowExceeded = errors.New("stream receive window exceeded")
 	errStreamClosed          = errors.New("stream closed")
 	errStreamFinished        = errors.New("stream direction already finished")
+	errStreamNotStarted      = errors.New("stream has not sent SYN")
 )
 
 // Session wraps the data channel after bidirectional verify has succeeded
@@ -67,14 +68,14 @@ type stream struct {
 	abandon   sync.Once
 	closeOnce sync.Once
 
-	queueMu           sync.Mutex
-	queuedBytes       int
-	queuedFrames      int
-	receivedBytes     uint64
-	consumedBytes     uint64
-	advertisedMax     uint64
-	lastUpdateAt      uint64
-	initialWindowSent bool
+	queueMu       sync.Mutex
+	queuedBytes   int
+	queuedFrames  int
+	receivedBytes uint64
+	consumedBytes uint64
+	advertisedMax uint64
+	lastUpdateAt  uint64
+	windowActive  bool
 
 	sendMu           sync.Mutex
 	writeMu          sync.Mutex
@@ -307,7 +308,7 @@ func (s *Session) startDispatcher(p *Peer) {
 					switch {
 					case errors.Is(err, errReceiveWindowExceeded):
 						code = "flow_control_violation"
-					case errors.Is(err, errStreamFinished):
+					case errors.Is(err, errStreamFinished), errors.Is(err, errStreamNotStarted):
 						code = "protocol_error"
 					}
 					s.failStream(st, code, err.Error(), true)
@@ -434,6 +435,10 @@ func (st *stream) enqueue(frame protocol.Frame, enforceWindow bool) error {
 	}
 	flowBytes := frame.FlowBytes()
 	st.queueMu.Lock()
+	if enforceWindow && !st.windowActive {
+		st.queueMu.Unlock()
+		return errStreamNotStarted
+	}
 	if enforceWindow && (st.receivedBytes > st.advertisedMax || flowBytes > st.advertisedMax-st.receivedBytes) {
 		st.queueMu.Unlock()
 		return errReceiveWindowExceeded
@@ -492,15 +497,23 @@ func (st *stream) consume(frame protocol.Frame, flowControl bool) (uint64, bool)
 	return maxBytes, true
 }
 
-func (st *stream) prepareInitialWindow() (uint64, bool) {
+func (st *stream) activateInitialWindow() {
+	st.queueMu.Lock()
+	activate := !st.windowActive
+	if activate {
+		st.advertisedMax = protocol.InitialStreamWindow
+		st.windowActive = true
+	}
+	st.queueMu.Unlock()
+	if activate {
+		st.updateSendLimit(protocol.InitialStreamWindow)
+	}
+}
+
+func (st *stream) initialWindowActive() bool {
 	st.queueMu.Lock()
 	defer st.queueMu.Unlock()
-	if st.initialWindowSent {
-		return st.advertisedMax, false
-	}
-	st.initialWindowSent = true
-	st.advertisedMax = protocol.InitialStreamWindow
-	return st.advertisedMax, true
+	return st.windowActive
 }
 
 func (st *stream) reserveSend(n uint64, sessionDone <-chan struct{}) error {
@@ -671,8 +684,6 @@ func (s *Session) sendFrame(streamID uint32, flags uint16, payload []byte) error
 	}
 	frame := protocol.Frame{StreamID: streamID, Flags: flags, Payload: payload}
 	var st *stream
-	var sendInitialWindow bool
-	var initialWindow uint64
 	if streamID != 0 {
 		st = s.findStream(streamID)
 		if st == nil {
@@ -686,9 +697,16 @@ func (s *Session) sendFrame(streamID uint32, flags uint16, payload []byte) error
 			return errStreamFinished
 		}
 	}
-	if s.flowControlEnabled() && streamID != 0 {
+	flowControl := s.flowControlEnabled() && streamID != 0
+	if flowControl {
+		if !frame.IsSYN() && !st.initialWindowActive() {
+			return errStreamNotStarted
+		}
 		if frame.IsSYN() {
-			initialWindow, sendInitialWindow = st.prepareInitialWindow()
+			// Activate receive credit before the ordered SYN goes on the wire,
+			// so an immediate response cannot race the receive-window check.
+			// writeMu keeps later local data behind the SYN itself.
+			st.activateInitialWindow()
 		}
 		if err := st.reserveSend(frame.FlowBytes(), s.done); err != nil {
 			return err
@@ -696,13 +714,10 @@ func (s *Session) sendFrame(streamID uint32, flags uint16, payload []byte) error
 	}
 
 	if err := s.sendRawFrame(streamID, flags, payload); err != nil {
-		return err
-	}
-	if sendInitialWindow {
-		if err := s.sendWindowUpdate(streamID, initialWindow); err != nil {
-			s.failStream(st, "control_send_failed", err.Error(), false)
-			return err
+		if flowControl && frame.IsSYN() {
+			s.failStream(st, "send_error", err.Error(), false)
 		}
+		return err
 	}
 	if st != nil && frame.IsFIN() {
 		st.outboundFIN.Store(true)

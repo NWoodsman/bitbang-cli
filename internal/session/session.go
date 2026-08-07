@@ -221,11 +221,6 @@ func (s *Session) processStreamFrame(st *streamState, stream *streamCtx, frame p
 		if err := st.handler.OnSYN(stream, frame.Payload, frame.IsFIN()); err != nil {
 			return err
 		}
-		if st.flow {
-			if err := s.sendWindowUpdate(st, protocol.InitialStreamWindow); err != nil {
-				return fmt.Errorf("send initial window: %w", err)
-			}
-		}
 		if frame.IsFIN() {
 			s.markReceiveClosed(st)
 		}
