@@ -245,9 +245,16 @@ type ShellHandler struct {
 	// when ForcedArgv is empty.
 	ForcedEnv []string
 
-	// ViewOnly drops stdin, signals, and stdin EOF. Resize remains enabled
-	// so the remote PTY matches the viewer's terminal. Command-level
-	// restrictions, such as tmux attach -r, provide a second boundary.
+	// ViewOnly drops stdin, signals, and stdin EOF at the transport layer.
+	// Resize stays enabled so each viewer's own PTY matches their terminal;
+	// that is per-peer and only becomes a shared-state question when peers
+	// attach to one terminal (bitbang share). There the cross-peer guarantee
+	// is tmux's, not ours: viewers attach with `tmux attach -r`, which since
+	// tmux 3.2 is an alias for read-only,ignore-size, and ignore-size means a
+	// client cannot affect the size of other clients. The >= 3.2 floor is
+	// enforced by share.CheckVersion (wired at cmd/bitbang/share.go), so -r
+	// always carries ignore-size. Pinned by TestViewerAttachesReadOnly and
+	// TestViewerCannotResizeWhileControlAttached.
 	ViewOnly bool
 
 	// AcquireSlot, if non-nil, replaces the process-wide MaxConcurrent

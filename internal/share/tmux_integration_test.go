@@ -141,53 +141,60 @@ func TestViewerAttachesReadOnly(t *testing.T) {
 
 // An ignore-size viewer must not resize the window while a read-write client
 // is attached. A lone viewer still supplies tmux's only available size.
+// Pinned under both window-size modes: latest (tmux's default) and smallest
+// (a common config, and the mode that would shrink everyone if a viewer's
+// size counted). ignore-size must hold regardless of mode.
 func TestViewerCannotResizeWhileControlAttached(t *testing.T) {
 	requireTmux(t)
-	r, socket := isolatedServer(t)
+	for _, windowSize := range []string{"latest", "smallest"} {
+		t.Run(windowSize, func(t *testing.T) {
+			r, socket := isolatedServer(t)
 
-	if _, err := r.Run("set-option", "-g", "window-size", "latest"); err != nil {
-		t.Fatalf("set window-size: %v", err)
-	}
+			if _, err := r.Run("set-option", "-g", "window-size", windowSize); err != nil {
+				t.Fatalf("set window-size: %v", err)
+			}
 
-	control := attachHandler(socket, "shared", false)
-	controlStream := newTmuxCapture()
-	bigSYN, _ := json.Marshal(map[string]interface{}{"type": "shell", "pty": true, "cols": 80, "rows": 24})
-	if err := control.OnSYN(controlStream, bigSYN, false); err != nil {
-		t.Fatalf("control OnSYN: %v", err)
-	}
-	defer control.Close()
+			control := attachHandler(socket, "shared", false)
+			controlStream := newTmuxCapture()
+			bigSYN, _ := json.Marshal(map[string]interface{}{"type": "shell", "pty": true, "cols": 80, "rows": 24})
+			if err := control.OnSYN(controlStream, bigSYN, false); err != nil {
+				t.Fatalf("control OnSYN: %v", err)
+			}
+			defer control.Close()
 
-	waitFor(t, "control client to attach", func() bool {
-		out, _ := r.Run("list-clients", "-t", "shared", "-F", "#{client_readonly}")
-		return strings.Contains(out, "0")
-	})
-	time.Sleep(300 * time.Millisecond)
-	before, err := r.Run("display-message", "-p", "-t", "shared", "#{window_width}x#{window_height}")
-	if err != nil {
-		t.Fatalf("display-message: %v", err)
-	}
+			waitFor(t, "control client to attach", func() bool {
+				out, _ := r.Run("list-clients", "-t", "shared", "-F", "#{client_readonly}")
+				return strings.Contains(out, "0")
+			})
+			time.Sleep(300 * time.Millisecond)
+			before, err := r.Run("display-message", "-p", "-t", "shared", "#{window_width}x#{window_height}")
+			if err != nil {
+				t.Fatalf("display-message: %v", err)
+			}
 
-	viewer := attachHandler(socket, "shared", true)
-	viewerStream := newTmuxCapture()
-	// Deliberately a phone-shaped geometry, far from the controller's.
-	smallSYN, _ := json.Marshal(map[string]interface{}{"type": "shell", "pty": true, "cols": 40, "rows": 12})
-	if err := viewer.OnSYN(viewerStream, smallSYN, false); err != nil {
-		t.Fatalf("viewer OnSYN: %v", err)
-	}
-	defer viewer.Close()
+			viewer := attachHandler(socket, "shared", true)
+			viewerStream := newTmuxCapture()
+			// Deliberately a phone-shaped geometry, far from the controller's.
+			smallSYN, _ := json.Marshal(map[string]interface{}{"type": "shell", "pty": true, "cols": 40, "rows": 12})
+			if err := viewer.OnSYN(viewerStream, smallSYN, false); err != nil {
+				t.Fatalf("viewer OnSYN: %v", err)
+			}
+			defer viewer.Close()
 
-	waitFor(t, "viewer client to attach", func() bool {
-		out, _ := r.Run("list-clients", "-t", "shared", "-F", "#{client_readonly}")
-		return strings.Contains(out, "1")
-	})
-	time.Sleep(500 * time.Millisecond) // let any (unwanted) resize settle
+			waitFor(t, "viewer client to attach", func() bool {
+				out, _ := r.Run("list-clients", "-t", "shared", "-F", "#{client_readonly}")
+				return strings.Contains(out, "1")
+			})
+			time.Sleep(500 * time.Millisecond) // let any (unwanted) resize settle
 
-	after, err := r.Run("display-message", "-p", "-t", "shared", "#{window_width}x#{window_height}")
-	if err != nil {
-		t.Fatalf("display-message: %v", err)
-	}
-	if after != before {
-		t.Errorf("viewer resized the shared window out from under the controller: %s -> %s", before, after)
+			after, err := r.Run("display-message", "-p", "-t", "shared", "#{window_width}x#{window_height}")
+			if err != nil {
+				t.Fatalf("display-message: %v", err)
+			}
+			if after != before {
+				t.Errorf("viewer resized the shared window out from under the controller: %s -> %s", before, after)
+			}
+		})
 	}
 }
 
