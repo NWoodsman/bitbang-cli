@@ -14,11 +14,59 @@ func share(dir string, upload bool) *FileShare {
 	return &FileShare{BasePath: dir, Mode: ModeBrowse, UploadEnabled: upload}
 }
 
+// failOnLeakedHandles reports any file under dir still open when the test
+// ends.
+//
+// This exists because the failure is otherwise invisible on Linux and
+// baffling on Windows. A test that forgets to close an io.ReadCloser leaves
+// the file open; Linux unlinks it happily, so t.TempDir cleans up and the
+// test passes. Windows refuses to delete an open file, so cleanup fails and
+// the error surfaces against testing.go rather than against the line that
+// opened it -- on the one platform that is hardest to reproduce locally.
+//
+// Register it *after* t.TempDir. Cleanups run last-registered-first, so this
+// runs while the directory still exists.
+//
+// Linux-only, since it reads /proc/self/fd. That is enough: the point is to
+// fail on the platform where the problem is easy to see.
+func failOnLeakedHandles(t *testing.T, dir string) {
+	t.Helper()
+	t.Cleanup(func() {
+		if runtime.GOOS != "linux" {
+			return
+		}
+		root, err := filepath.EvalSymlinks(dir)
+		if err != nil {
+			return
+		}
+		entries, err := os.ReadDir("/proc/self/fd")
+		if err != nil {
+			return
+		}
+		var leaked []string
+		for _, e := range entries {
+			target, err := os.Readlink(filepath.Join("/proc/self/fd", e.Name()))
+			if err != nil {
+				continue // fd closed while we walked, or not a symlink
+			}
+			if strings.HasPrefix(target, root+string(os.PathSeparator)) {
+				leaked = append(leaked, target)
+			}
+		}
+		for _, path := range leaked {
+			t.Errorf("file left open at test end: %s\n"+
+				"\tclose every io.ReadCloser/io.WriteCloser the test obtains, or "+
+				"t.TempDir cleanup fails on Windows", path)
+		}
+	})
+}
+
 // outside creates a sibling directory holding a secret file, plus the share
 // root itself. Returned as (shareDir, outsideDir).
 func outside(t *testing.T) (string, string) {
 	t.Helper()
 	root := t.TempDir()
+	failOnLeakedHandles(t, root)
 	shareDir := filepath.Join(root, "share")
 	outsideDir := filepath.Join(root, "outside")
 	for _, d := range []string{shareDir, outsideDir} {
