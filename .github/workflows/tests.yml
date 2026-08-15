@@ -21,6 +21,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: '1.25'
+          check-latest: true
 
       # ./... rather than ./internal/... -- the latter silently skipped
       # every test under cmd/bitbang (arg reordering, serve-mode routing,
@@ -39,6 +40,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: '1.25'
+          check-latest: true
 
       # Symbol-level, not just "is this module version listed": govulncheck
       # traces whether our code actually reaches the vulnerable function, so
@@ -61,6 +63,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: '1.25'
+          check-latest: true
 
       - uses: actions/setup-python@v5
         with:
