@@ -6,8 +6,26 @@ import (
 	"testing"
 )
 
+// resolvedTempDir is t.TempDir() with symlinks already resolved.
+//
+// SafePath returns a fully-resolved path, so a test comparing against a raw
+// t.TempDir() passes only where the temp directory happens to contain no
+// symlinks. That is true on most Linux boxes and false elsewhere: macOS puts
+// temp dirs under /var, a symlink to /private/var, and Windows hands back an
+// 8.3 short name that resolution expands. Resolving here keeps the comparison
+// about SafePath rather than about the host's temp layout.
+func resolvedTempDir(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	real, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		t.Fatalf("resolve temp dir: %v", err)
+	}
+	return real
+}
+
 func TestSafePathInsideBase(t *testing.T) {
-	base := t.TempDir()
+	base := resolvedTempDir(t)
 	sub := filepath.Join(base, "sub")
 	if err := os.Mkdir(sub, 0o755); err != nil {
 		t.Fatal(err)
@@ -19,7 +37,7 @@ func TestSafePathInsideBase(t *testing.T) {
 }
 
 func TestSafePathBaseItself(t *testing.T) {
-	base := t.TempDir()
+	base := resolvedTempDir(t)
 	got := SafePath(base, "")
 	if got != base {
 		t.Errorf("SafePath(base, '') = %q, want %q", got, base)
