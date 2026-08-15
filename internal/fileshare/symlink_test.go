@@ -183,7 +183,11 @@ func TestReadPathsEnforceShouldShow(t *testing.T) {
 
 	f := share(shareDir, false)
 	for _, p := range []string{".env", ".git/config", ".git"} {
-		if _, _, err := f.OpenRead(p); err == nil {
+		// Close on the unexpected-success path too: t.TempDir cleanup fails
+		// on Windows if anything still holds the file open, which turns a
+		// leaked handle into a confusing failure in an unrelated place.
+		if r, _, err := f.OpenRead(p); err == nil {
+			r.Close()
 			t.Errorf("OpenRead(%q) succeeded; hidden entries must not be readable by path", p)
 		}
 		if _, err := f.StatPath(p); err == nil {
@@ -195,7 +199,9 @@ func TestReadPathsEnforceShouldShow(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(shareDir, "visible.txt"), []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := f.OpenRead("visible.txt"); err != nil {
-		t.Errorf("OpenRead rejected an ordinary file: %v", err)
+	r, _, err := f.OpenRead("visible.txt")
+	if err != nil {
+		t.Fatalf("OpenRead rejected an ordinary file: %v", err)
 	}
+	r.Close()
 }
