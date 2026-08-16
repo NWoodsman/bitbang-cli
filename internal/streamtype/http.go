@@ -128,10 +128,15 @@ func (h *HTTPHandler) OnConnect(path string) error {
 					sawHTTPSRedirect = true
 				}
 				if r.URL.Host != "" && r.URL.Host != h.connTarget {
-					h.connTarget = r.URL.Host
-					h.targetPrefix = "/" + r.URL.Host
-					if h.Verbose {
-						log.Printf("Target resolved: %s (from probe)", r.URL.Host)
+					if h.allowRebind(r.URL.Host) {
+						h.connTarget = r.URL.Host
+						h.targetPrefix = "/" + r.URL.Host
+						if h.Verbose {
+							log.Printf("Target resolved: %s (from probe)", r.URL.Host)
+						}
+					} else if h.Verbose {
+						log.Printf("Ignoring probe redirect to %s: --target %s is pinned",
+							r.URL.Host, h.Target)
 					}
 				}
 				return http.ErrUseLastResponse
@@ -213,6 +218,43 @@ func (h *HTTPHandler) SkipVerify() bool { return h.skipVerify() }
 
 func (h *HTTPHandler) skipVerify() bool {
 	return h.scheme() == "https" && isLocalHost(h.connTarget)
+}
+
+// allowRebind reports whether a redirect to host may repoint this session.
+//
+// In dynamic mode the connector chose the target, so following a redirect
+// wherever it leads is the intended behavior -- that is how nas.local ends up
+// at nas.local:5000.
+//
+// With --target the operator chose it, and a cross-host redirect would
+// silently repoint the session for the rest of its life: the pinned Target is
+// never restored, and resolveTarget hands out the mutated connTarget. A
+// cooperative target, or an open redirect on it, would be enough to move
+// traffic somewhere the operator did not authorize. Only a port change on the
+// same hostname is allowed, which is the case the redirect-following exists
+// for.
+//
+// The comparison is against Target rather than connTarget so a chain of
+// redirects cannot walk away from the pin one hop at a time.
+func (h *HTTPHandler) allowRebind(host string) bool {
+	if h.Target == "" {
+		return true
+	}
+	return sameHostname(host, h.Target)
+}
+
+// sameHostname compares the host portions of two host[:port] strings,
+// ignoring the port, case, and IPv6 brackets.
+func sameHostname(a, b string) bool {
+	return strings.EqualFold(hostOnly(a), hostOnly(b))
+}
+
+func hostOnly(hostPort string) string {
+	host := hostPort
+	if h, _, err := net.SplitHostPort(hostPort); err == nil {
+		host = h
+	}
+	return strings.Trim(host, "[]")
 }
 
 // httpClient returns a client for this session, with the transport chosen
@@ -423,6 +465,15 @@ func (h *HTTPHandler) proxyRequestContext(ctx context.Context, s Stream, req pro
 		Transport: h.transport(),
 		CheckRedirect: func(r *http.Request, via []*http.Request) error {
 			if r.URL.Host != "" && r.URL.Host != target {
+				if !h.allowRebind(r.URL.Host) {
+					// Pinned target: hand the 302 back to the browser rather
+					// than following it into a host the operator did not name.
+					if h.Verbose {
+						log.Printf("Not following redirect to %s: --target %s is pinned",
+							r.URL.Host, h.Target)
+					}
+					return http.ErrUseLastResponse
+				}
 				h.connTarget = r.URL.Host
 				h.targetPrefix = "/" + r.URL.Host
 				if h.Verbose {

@@ -132,10 +132,13 @@ func TestPoCExactSequence_Rejected(t *testing.T) {
 		[]byte(`{"type":"connect","path":"/","version":3}`))
 	sess.HandleMessage(connect)
 
-	// Connect must have reached OnConnect (target pinned) but the
-	// session must NOT be ready — PIN was required and never supplied.
-	if h.connects != 1 {
-		t.Fatalf("OnConnect calls = %d, want 1 (connect should pin target)", h.connects)
+	// OnConnect must NOT have run: handler setup is not passive. The HTTP
+	// proxy's OnConnect dials the target and probes it, so running it here
+	// would let a code-holder without the PIN make the listener connect to
+	// any host:port and tell open from closed by which control frame came
+	// back. Setup is deferred until after a successful auth.
+	if h.connects != 0 {
+		t.Fatalf("OnConnect calls = %d, want 0 (handler setup must wait for auth)", h.connects)
 	}
 	sess.mu.Lock()
 	ready := sess.ready
@@ -261,5 +264,50 @@ func TestSYNAfterFailedPIN_StillRejected(t *testing.T) {
 
 	if h.onSYN != 0 {
 		t.Errorf("handler.OnSYN called %d times after failed PIN", h.onSYN)
+	}
+}
+
+// The PIN gate defers handler setup rather than skipping it: a correct PIN
+// must still pin the proxy target before ready goes out, or the first
+// request would arrive with no target resolved.
+func TestOnConnectDeferredUntilAuth(t *testing.T) {
+	h := &countingHandler{}
+	sess, _ := newTestSession(t, "1234", h)
+
+	connect := protocol.BuildFrame(0, protocol.FlagSYN,
+		[]byte(`{"type":"connect","path":"/nas.local","version":3}`))
+	sess.HandleMessage(connect)
+	if h.connects != 0 {
+		t.Fatalf("OnConnect calls before auth = %d, want 0", h.connects)
+	}
+
+	auth := protocol.BuildFrame(0, protocol.FlagSYN,
+		[]byte(`{"type":"auth","pin":"1234"}`))
+	sess.HandleMessage(auth)
+
+	if h.connects != 1 {
+		t.Errorf("OnConnect calls after a correct PIN = %d, want 1", h.connects)
+	}
+	sess.mu.Lock()
+	ready := sess.ready
+	sess.mu.Unlock()
+	if !ready {
+		t.Error("session not ready after a correct PIN")
+	}
+}
+
+// A wrong PIN must not run handler setup either -- otherwise the probe fires
+// on every guess, which is the scan this ordering exists to prevent.
+func TestOnConnectNotRunOnFailedAuth(t *testing.T) {
+	h := &countingHandler{}
+	sess, _ := newTestSession(t, "1234", h)
+
+	sess.HandleMessage(protocol.BuildFrame(0, protocol.FlagSYN,
+		[]byte(`{"type":"connect","path":"/nas.local","version":3}`)))
+	sess.HandleMessage(protocol.BuildFrame(0, protocol.FlagSYN,
+		[]byte(`{"type":"auth","pin":"9999"}`)))
+
+	if h.connects != 0 {
+		t.Errorf("OnConnect calls after a wrong PIN = %d, want 0", h.connects)
 	}
 }
