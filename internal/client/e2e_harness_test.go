@@ -262,13 +262,16 @@ func startListener(host string, id *identity.Identity, handlers ...streamtype.St
 				if closer, ok := handler.(interface{ CloseAll() }); ok {
 					closeHandlers = append(closeHandlers, closer.CloseAll)
 				}
+				if closer, ok := handler.(interface{ Close() }); ok {
+					closeHandlers = append(closeHandlers, closer.Close)
+				}
 			}
-			c.OnClose = func() {
+			c.SetOnClose(func() {
 				newSession.Close()
 				for _, closeHandler := range closeHandlers {
 					closeHandler()
 				}
-			}
+			})
 		case "answer":
 			sdp, _ := msg["sdp"].(string)
 			enc, _ := msg["encrypted_request"].(string)

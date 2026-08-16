@@ -228,13 +228,19 @@ func (s *Session) sendReady() {
 	s.mu.Lock()
 	negotiatedVersion := s.negotiatedVersion
 	s.mu.Unlock()
-	ready, _ := json.Marshal(map[string]interface{}{
+	readyMsg := map[string]interface{}{
 		"type":               "ready",
 		"server_version":     protocol.SWSPVersion,
 		"negotiated_version": negotiatedVersion,
 		"caps":               caps,
 		"routing":            "target-prefix",
-	})
+	}
+	// access is additive (like want_code on register): only present when
+	// the listener granted a per-peer role, and old clients ignore it.
+	if s.Access != "" {
+		readyMsg["access"] = s.Access
+	}
+	ready, _ := json.Marshal(readyMsg)
 	_ = s.sendFrame(0, protocol.FlagSYN|protocol.FlagFIN, ready)
 
 	// Channel is verified and ready — kick off the video PC handshake once.

@@ -56,6 +56,17 @@ const (
 	ControlStreamReset  = "stream_reset"
 )
 
+// Access is the role granted to a peer during credential verification.
+// Empty access preserves the behavior of listeners with one undifferentiated
+// credential.
+type Access string
+
+const (
+	AccessDefault Access = ""
+	AccessControl Access = "control"
+	AccessView    Access = "view"
+)
+
 // WindowUpdate raises the cumulative number of payload bytes the peer may
 // send in one direction of a stream. Updates are monotonic, which makes stale
 // or duplicate controls harmless.
