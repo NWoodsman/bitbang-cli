@@ -15,12 +15,13 @@ func readySession(t *testing.T, access protocol.Access) map[string]interface{} {
 	t.Helper()
 	h := &countingHandler{}
 	sess := &Session{
-		PIN:           auth.New(""),
-		Access:        access,
-		handlers:      map[string]streamtype.StreamHandler{h.Type(): h},
-		streamHandler: make(map[uint32]streamtype.StreamHandler),
-		reasm:         make(map[uint32][]byte),
+		PIN:      auth.New(""),
+		Access:   access,
+		handlers: map[string]streamtype.StreamHandler{h.Type(): h},
+		streams:  make(map[uint32]*streamState),
+		done:     make(chan struct{}),
 	}
+	t.Cleanup(sess.Close)
 
 	var readyPayload []byte
 	sess.sendFrame = func(streamID uint32, flags uint16, payload []byte) error {

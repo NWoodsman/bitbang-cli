@@ -29,8 +29,33 @@ func (s *Session) handleControl(frame protocol.Frame) {
 		return
 	}
 
+	var envelope struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(frame.Payload, &envelope); err != nil {
+		return
+	}
+
+	switch envelope.Type {
+	case protocol.ControlWindowUpdate:
+		var update protocol.WindowUpdate
+		if err := json.Unmarshal(frame.Payload, &update); err != nil {
+			s.resetMalformedControl(frame.Payload, err)
+			return
+		}
+		s.applyWindowUpdate(update)
+		return
+	case protocol.ControlStreamReset:
+		var reset protocol.StreamReset
+		if err := json.Unmarshal(frame.Payload, &reset); err != nil {
+			s.resetMalformedControl(frame.Payload, err)
+			return
+		}
+		s.applyStreamReset(reset)
+		return
+	}
+
 	var msg struct {
-		Type      string                 `json:"type"`
 		Path      string                 `json:"path"`
 		PIN       string                 `json:"pin"`
 		Version   int                    `json:"version"`
@@ -41,7 +66,7 @@ func (s *Session) handleControl(frame protocol.Frame) {
 		return
 	}
 
-	switch msg.Type {
+	switch envelope.Type {
 	case "connect":
 		s.handleConnect(msg.Path, msg.Version)
 	case "auth":
@@ -63,7 +88,7 @@ func (s *Session) handleControl(frame protocol.Frame) {
 	}
 }
 
-func (s *Session) handleConnect(path string, _ int) {
+func (s *Session) handleConnect(path string, peerVersion int) {
 	if path == "" {
 		path = "/"
 	}
@@ -72,20 +97,32 @@ func (s *Session) handleConnect(path string, _ int) {
 	s.connectPath = path
 	s.mu.Unlock()
 
-	// Notify all registered handlers so they can set up per-session state
-	// (e.g. the HTTP proxy resolves its target from the connect path).
-	for _, h := range s.handlers {
-		if err := h.OnConnect(path); err != nil {
-			log.Printf("Handler %q OnConnect rejected connect: %v", h.Type(), err)
-			s.sendControlError(err.Error())
-			return
-		}
+	// Lock the transport semantics after the first accepted connect. Browser
+	// navigation can send another connect to update routing, but changing flow
+	// control while streams are live would make byte accounting ambiguous.
+	s.mu.Lock()
+	if s.negotiatedVersion == 0 {
+		s.negotiatedVersion = protocol.NegotiateSWSPVersion(peerVersion)
 	}
+	s.mu.Unlock()
 
+	// The PIN gate comes before any handler setup, because handler setup is
+	// not passive: the HTTP proxy's OnConnect dials the target and probes it.
+	// Running that first let a code-holder who does not know the PIN make the
+	// listener connect to any host:port and tell open from closed by whether
+	// auth_required or error came back -- an arbitrary port scan of the
+	// listener's network in dynamic-target mode, before authenticating.
+	//
+	// Handler setup moves to notifyHandlers, called after a successful auth
+	// instead.
 	if s.PIN.Required() {
 		log.Printf("PIN required for connection")
 		authReq, _ := json.Marshal(map[string]string{"type": "auth_required"})
 		_ = s.sendFrame(0, protocol.FlagSYN, authReq)
+		return
+	}
+
+	if !s.notifyHandlers(path) {
 		return
 	}
 
@@ -97,12 +134,41 @@ func (s *Session) handleConnect(path string, _ int) {
 	s.sendReady()
 }
 
+// notifyHandlers lets every registered handler set up per-session state
+// (e.g. the HTTP proxy resolves and probes its target from the connect path).
+// Reports whether the session may proceed; on failure it has already sent the
+// control error.
+//
+// Called after authentication, never before -- see the PIN gate in
+// handleConnect.
+func (s *Session) notifyHandlers(path string) bool {
+	for _, h := range s.handlers {
+		if err := h.OnConnect(path); err != nil {
+			log.Printf("Handler %q OnConnect rejected connect: %v", h.Type(), err)
+			s.sendControlError(err.Error())
+			return false
+		}
+	}
+	return true
+}
+
 func (s *Session) handleAuth(pin string) {
 	if !s.PIN.Required() {
 		return
 	}
 	if s.PIN.Verify(pin) {
 		log.Printf("PIN auth succeeded")
+		s.mu.Lock()
+		path := s.connectPath
+		s.mu.Unlock()
+		if path == "" {
+			path = "/"
+		}
+		// Deferred from handleConnect so an unauthenticated peer cannot make
+		// the listener dial anything.
+		if !s.notifyHandlers(path) {
+			return
+		}
 		s.mu.Lock()
 		s.authenticated = true
 		s.ready = true
@@ -159,11 +225,15 @@ func (s *Session) sendReady() {
 	// cookies between different LAN hosts reached through the same UID;
 	// direct adapters (bitbang-python's WSGI/ASGI) declare "direct"
 	// instead, and everything under one UID shares a cookie jar.
+	s.mu.Lock()
+	negotiatedVersion := s.negotiatedVersion
+	s.mu.Unlock()
 	readyMsg := map[string]interface{}{
-		"type":           "ready",
-		"server_version": protocol.SWSPVersion,
-		"caps":           caps,
-		"routing":        "target-prefix",
+		"type":               "ready",
+		"server_version":     protocol.SWSPVersion,
+		"negotiated_version": negotiatedVersion,
+		"caps":               caps,
+		"routing":            "target-prefix",
 	}
 	// access is additive (like want_code on register): only present when
 	// the listener granted a per-peer role, and old clients ignore it.

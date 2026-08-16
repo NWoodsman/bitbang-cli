@@ -6,6 +6,7 @@ import (
 	"mime"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/richlegrand/bitbang/internal/streamtype"
 )
@@ -111,7 +112,7 @@ func (f *FileShare) OpenWrite(relPath string, overwrite bool) (io.WriteCloser, e
 }
 
 // resolveForRead returns the absolute path inside BasePath, or "" on
-// traversal / not-found.
+// traversal / not-found / hidden.
 func (f *FileShare) resolveForRead(relPath string) string {
 	if f.Mode == ModeSend {
 		// In send mode the only "path" is the shared file itself; any
@@ -121,11 +122,56 @@ func (f *FileShare) resolveForRead(relPath string) string {
 		}
 		return ""
 	}
-	return SafePath(f.BasePath, relPath)
+	abs := SafePath(f.BasePath, relPath)
+	if abs == "" || !visibleUnder(f.BasePath, abs) {
+		return ""
+	}
+	return abs
+}
+
+// visibleUnder reports whether every path component between the share root
+// and abs passes ShouldShow.
+//
+// Hiding an entry from the listing is not a read control on its own: without
+// this, ".env" is absent from a directory listing but still served to anyone
+// who asks for it by name, and so is anything inside a hidden directory.
+// Checking the whole relative path rather than just the basename is what
+// stops ".git/config" from being reachable while ".git" is hidden.
+func visibleUnder(baseDir, abs string) bool {
+	base, err := filepath.Abs(baseDir)
+	if err != nil {
+		return false
+	}
+	if real, err := filepath.EvalSymlinks(base); err == nil {
+		base = real
+	}
+	rel, err := filepath.Rel(base, abs)
+	if err != nil {
+		return false
+	}
+	if rel == "." {
+		return true
+	}
+	for _, part := range strings.Split(rel, string(os.PathSeparator)) {
+		if part == "" || part == "." {
+			continue
+		}
+		if !ShouldShow(part, false) {
+			return false
+		}
+	}
+	return true
 }
 
 // resolveForWrite is like resolveForRead but accepts paths whose parent
 // is inside BasePath, even if the file itself doesn't yet exist.
+//
+// Symlinks are resolved for the same reason as in SafePath, but there are
+// two cases rather than one. If the target already exists it may itself be a
+// symlink pointing outside the share, and os.Create would follow it — so the
+// target is resolved and re-checked. If it doesn't exist there is nothing to
+// resolve, and the parent directory carries the check instead, since a
+// symlinked parent redirects the write just as effectively.
 func (f *FileShare) resolveForWrite(relPath string) (string, error) {
 	base, err := filepath.Abs(f.BasePath)
 	if err != nil {
@@ -135,22 +181,33 @@ func (f *FileShare) resolveForWrite(relPath string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if requested != base && !hasPrefixSep(requested, base) {
+	if !withinBase(requested, base) {
 		return "", errors.New("path traversal")
 	}
-	// Parent must exist and be a directory.
-	parent := filepath.Dir(requested)
-	if st, err := os.Stat(parent); err != nil || !st.IsDir() {
+	realBase, err := filepath.EvalSymlinks(base)
+	if err != nil {
+		return "", err
+	}
+	// Existing target: resolve it and re-check.
+	if realPath, err := filepath.EvalSymlinks(requested); err == nil {
+		if !withinBase(realPath, realBase) {
+			return "", errors.New("path traversal")
+		}
+		return realPath, nil
+	}
+	// New file: the parent must exist, be a directory, and resolve inside
+	// the base.
+	realParent, err := filepath.EvalSymlinks(filepath.Dir(requested))
+	if err != nil {
 		return "", errors.New("parent directory does not exist")
 	}
-	return requested, nil
-}
-
-func hasPrefixSep(s, prefix string) bool {
-	if len(s) <= len(prefix) {
-		return false
+	if st, err := os.Stat(realParent); err != nil || !st.IsDir() {
+		return "", errors.New("parent directory does not exist")
 	}
-	return s[:len(prefix)] == prefix && s[len(prefix)] == os.PathSeparator
+	if !withinBase(realParent, realBase) {
+		return "", errors.New("path traversal")
+	}
+	return filepath.Join(realParent, filepath.Base(requested)), nil
 }
 
 func statForInfo(name string, info os.FileInfo) streamtype.FileStat {

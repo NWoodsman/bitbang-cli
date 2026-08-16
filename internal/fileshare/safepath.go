@@ -19,6 +19,17 @@ var systemFiles = map[string]bool{
 // to distinguish "outside base" from "not found" should reorder their
 // checks).
 //
+// Symlinks are resolved before the containment check. A lexical check alone
+// is not enough: a symlink inside the share whose target is outside it has a
+// path under base, so the prefix test passes and the kernel then follows the
+// link on open. Both sides must be resolved — a share root that is itself a
+// symlink is entirely normal (macOS /tmp -> /private/tmp, and many home and
+// NAS layouts), and comparing a resolved path against an unresolved base
+// would reject every such share.
+//
+// The returned path is fully resolved, so it contains no symlink components
+// for a later open to follow somewhere else.
+//
 // Mirrors Python's safe_path (core.py:36-59).
 func SafePath(baseDir, relPath string) string {
 	base, err := filepath.Abs(baseDir)
@@ -29,14 +40,30 @@ func SafePath(baseDir, relPath string) string {
 	if err != nil {
 		return ""
 	}
-	// Must be base itself or strictly inside base.
-	if requested != base && !strings.HasPrefix(requested, base+string(os.PathSeparator)) {
+	// Cheap lexical rejection first: catches ../ traversal without touching
+	// the filesystem.
+	if !withinBase(requested, base) {
 		return ""
 	}
-	if _, err := os.Stat(requested); err != nil {
+	realBase, err := filepath.EvalSymlinks(base)
+	if err != nil {
 		return ""
 	}
-	return requested
+	// Also rejects a path that doesn't exist, preserving the documented
+	// "" -on-not-found behavior.
+	realPath, err := filepath.EvalSymlinks(requested)
+	if err != nil {
+		return ""
+	}
+	if !withinBase(realPath, realBase) {
+		return ""
+	}
+	return realPath
+}
+
+// withinBase reports whether path is base itself or strictly inside it.
+func withinBase(path, base string) bool {
+	return path == base || strings.HasPrefix(path, base+string(os.PathSeparator))
 }
 
 // ShouldShow returns false for entries that should be hidden from the

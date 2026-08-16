@@ -1,7 +1,6 @@
 package streamtype
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -73,8 +72,8 @@ func NewHTTPProxy(target, uid, server, browserIP string, verbose bool) *HTTPHand
 }
 
 type pendingStream struct {
-	req protocol.Request
-	pw  *io.PipeWriter
+	pw     *io.PipeWriter
+	cancel context.CancelFunc
 }
 
 // Type implements StreamHandler.
@@ -129,10 +128,15 @@ func (h *HTTPHandler) OnConnect(path string) error {
 					sawHTTPSRedirect = true
 				}
 				if r.URL.Host != "" && r.URL.Host != h.connTarget {
-					h.connTarget = r.URL.Host
-					h.targetPrefix = "/" + r.URL.Host
-					if h.Verbose {
-						log.Printf("Target resolved: %s (from probe)", r.URL.Host)
+					if h.allowRebind(r.URL.Host) {
+						h.connTarget = r.URL.Host
+						h.targetPrefix = "/" + r.URL.Host
+						if h.Verbose {
+							log.Printf("Target resolved: %s (from probe)", r.URL.Host)
+						}
+					} else if h.Verbose {
+						log.Printf("Ignoring probe redirect to %s: --target %s is pinned",
+							r.URL.Host, h.Target)
 					}
 				}
 				return http.ErrUseLastResponse
@@ -216,6 +220,43 @@ func (h *HTTPHandler) skipVerify() bool {
 	return h.scheme() == "https" && isLocalHost(h.connTarget)
 }
 
+// allowRebind reports whether a redirect to host may repoint this session.
+//
+// In dynamic mode the connector chose the target, so following a redirect
+// wherever it leads is the intended behavior -- that is how nas.local ends up
+// at nas.local:5000.
+//
+// With --target the operator chose it, and a cross-host redirect would
+// silently repoint the session for the rest of its life: the pinned Target is
+// never restored, and resolveTarget hands out the mutated connTarget. A
+// cooperative target, or an open redirect on it, would be enough to move
+// traffic somewhere the operator did not authorize. Only a port change on the
+// same hostname is allowed, which is the case the redirect-following exists
+// for.
+//
+// The comparison is against Target rather than connTarget so a chain of
+// redirects cannot walk away from the pin one hop at a time.
+func (h *HTTPHandler) allowRebind(host string) bool {
+	if h.Target == "" {
+		return true
+	}
+	return sameHostname(host, h.Target)
+}
+
+// sameHostname compares the host portions of two host[:port] strings,
+// ignoring the port, case, and IPv6 brackets.
+func sameHostname(a, b string) bool {
+	return strings.EqualFold(hostOnly(a), hostOnly(b))
+}
+
+func hostOnly(hostPort string) string {
+	host := hostPort
+	if h, _, err := net.SplitHostPort(hostPort); err == nil {
+		host = h
+	}
+	return strings.Trim(host, "[]")
+}
+
 // httpClient returns a client for this session, with the transport chosen
 // by the trust decision: local HTTPS targets skip verification, everything
 // else verifies normally.
@@ -280,17 +321,26 @@ func (h *HTTPHandler) OnSYN(s Stream, payload []byte, final bool) error {
 		return nil
 	}
 
-	if final {
-		go h.proxyRequest(s, req, nil)
-		return nil
+	ctx, cancel := context.WithCancel(context.Background())
+	ps := &pendingStream{cancel: cancel}
+	var body io.Reader
+	if !final {
+		pr, pw := io.Pipe()
+		ps.pw = pw
+		body = pr
+	}
+	h.mu.Lock()
+	old := h.streams[s.ID()]
+	h.streams[s.ID()] = ps
+	h.mu.Unlock()
+	if old != nil {
+		old.close()
 	}
 
-	pr, pw := io.Pipe()
-	h.mu.Lock()
-	h.streams[s.ID()] = &pendingStream{req: req, pw: pw}
-	h.mu.Unlock()
-
-	go h.proxyRequest(s, req, pr)
+	go func() {
+		defer h.finishStream(s.ID(), ps)
+		h.proxyRequestContext(ctx, s, req, body)
+	}()
 	return nil
 }
 
@@ -299,11 +349,12 @@ func (h *HTTPHandler) OnDAT(s Stream, payload []byte) error {
 	h.mu.Lock()
 	ps := h.streams[s.ID()]
 	h.mu.Unlock()
-	if ps == nil {
+	if ps == nil || ps.pw == nil {
 		return nil
 	}
 	if len(payload) > 0 {
-		_, _ = ps.pw.Write(payload)
+		_, err := ps.pw.Write(payload)
+		return err
 	}
 	return nil
 }
@@ -313,19 +364,33 @@ func (h *HTTPHandler) OnDAT(s Stream, payload []byte) error {
 func (h *HTTPHandler) OnFIN(s Stream, payload []byte) error {
 	h.mu.Lock()
 	ps := h.streams[s.ID()]
-	delete(h.streams, s.ID())
 	h.mu.Unlock()
-	if ps == nil {
+	if ps == nil || ps.pw == nil {
 		return nil
 	}
 	if len(payload) > 0 {
-		_, _ = ps.pw.Write(payload)
+		if _, err := ps.pw.Write(payload); err != nil {
+			return err
+		}
 	}
-	_ = ps.pw.Close()
-	return nil
+	return ps.pw.Close()
+}
+
+func (h *HTTPHandler) OnReset(s Stream, _, _ string) {
+	h.mu.Lock()
+	ps := h.streams[s.ID()]
+	delete(h.streams, s.ID())
+	h.mu.Unlock()
+	if ps != nil {
+		ps.close()
+	}
 }
 
 func (h *HTTPHandler) proxyRequest(s Stream, req protocol.Request, body io.Reader) {
+	h.proxyRequestContext(context.Background(), s, req, body)
+}
+
+func (h *HTTPHandler) proxyRequestContext(ctx context.Context, s Stream, req protocol.Request, body io.Reader) {
 	if h.connTarget == "" {
 		h.serveLandingPage(s, req)
 		return
@@ -334,22 +399,17 @@ func (h *HTTPHandler) proxyRequest(s Stream, req protocol.Request, body io.Reade
 	target, pathname := h.resolveTarget(req.Pathname)
 	url := fmt.Sprintf("%s://%s%s", h.scheme(), target, pathname)
 
-	// Buffer the body so Content-Length is explicit (many embedded
-	// servers don't support chunked encoding).
+	// Stream request bytes directly into the upstream transport. Flow-control
+	// credit is returned only when this reader advances, so a slow target cannot
+	// turn an upload into an unbounded in-memory buffer. Browsers supply the
+	// length for ordinary form/file bodies; preserving it avoids chunked
+	// encoding for embedded servers that require Content-Length.
 	var reqBody io.Reader
-	var reqLen int64
 	if body != nil {
-		bodyBytes, err := io.ReadAll(body)
-		if err != nil {
-			log.Printf("Failed to read request body: %v", err)
-			h.sendError(s, 500, "Internal error")
-			return
-		}
-		reqBody = bytes.NewReader(bodyBytes)
-		reqLen = int64(len(bodyBytes))
+		reqBody = body
 	}
 
-	httpReq, err := http.NewRequest(req.Method, url, reqBody)
+	httpReq, err := http.NewRequestWithContext(ctx, req.Method, url, reqBody)
 	if err != nil {
 		log.Printf("Failed to create HTTP request: %v", err)
 		h.sendError(s, 500, "Internal error")
@@ -377,8 +437,8 @@ func (h *HTTPHandler) proxyRequest(s Stream, req protocol.Request, body io.Reade
 			httpReq.Header.Set("Content-Type", req.ContentType)
 		}
 	}
-	if reqLen > 0 {
-		httpReq.ContentLength = reqLen
+	if body != nil && req.ContentLength > 0 {
+		httpReq.ContentLength = int64(req.ContentLength)
 	}
 	httpReq.Host = target
 	httpReq.Header.Set("X-Forwarded-Host", h.Server)
@@ -405,6 +465,15 @@ func (h *HTTPHandler) proxyRequest(s Stream, req protocol.Request, body io.Reade
 		Transport: h.transport(),
 		CheckRedirect: func(r *http.Request, via []*http.Request) error {
 			if r.URL.Host != "" && r.URL.Host != target {
+				if !h.allowRebind(r.URL.Host) {
+					// Pinned target: hand the 302 back to the browser rather
+					// than following it into a host the operator did not name.
+					if h.Verbose {
+						log.Printf("Not following redirect to %s: --target %s is pinned",
+							r.URL.Host, h.Target)
+					}
+					return http.ErrUseLastResponse
+				}
 				h.connTarget = r.URL.Host
 				h.targetPrefix = "/" + r.URL.Host
 				if h.Verbose {
@@ -418,6 +487,9 @@ func (h *HTTPHandler) proxyRequest(s Stream, req protocol.Request, body io.Reade
 
 	resp, err := client.Do(httpReq)
 	if err != nil {
+		if ctx.Err() != nil {
+			return
+		}
 		log.Printf("Proxy request failed: %s %s -> %v", req.Method, req.Pathname, err)
 		h.sendError(s, 502, "Target unreachable")
 		return
@@ -469,6 +541,11 @@ func (h *HTTPHandler) proxyRequest(s Stream, req protocol.Request, body io.Reade
 		"headers": headers,
 	}
 	respJSON, _ := json.Marshal(respMeta)
+	if err := protocol.ValidateFramePayload(respJSON); err != nil {
+		log.Printf("HTTP response headers exceed SWSP frame limit: %v", err)
+		h.sendError(s, 502, "Response headers are too large")
+		return
+	}
 	if err := s.WriteSYN(respJSON); err != nil {
 		return
 	}
@@ -478,11 +555,17 @@ func (h *HTTPHandler) proxyRequest(s Stream, req protocol.Request, body io.Reade
 	totalBytes := 0
 	startTime := time.Now()
 	nextLogMB := 50
+	backpressureTick := time.NewTicker(time.Millisecond)
+	defer backpressureTick.Stop()
 	for {
 		n, readErr := resp.Body.Read(buf)
 		if n > 0 {
 			for s.BufferedAmount() > maxBuffered {
-				time.Sleep(1 * time.Millisecond)
+				select {
+				case <-ctx.Done():
+					return
+				case <-backpressureTick.C:
+				}
 			}
 			if err := s.WriteDAT(buf[:n]); err != nil {
 				log.Printf("WriteDAT failed (stream %d, %d bytes sent so far): %v", s.ID(), totalBytes, err)
@@ -508,6 +591,22 @@ func (h *HTTPHandler) proxyRequest(s Stream, req protocol.Request, body io.Reade
 
 	if h.Verbose || resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		log.Printf("%s %s -> %d (%d bytes)", req.Method, pathname, resp.StatusCode, totalBytes)
+	}
+}
+
+func (h *HTTPHandler) finishStream(id uint32, want *pendingStream) {
+	h.mu.Lock()
+	if h.streams[id] == want {
+		delete(h.streams, id)
+	}
+	h.mu.Unlock()
+	want.close()
+}
+
+func (ps *pendingStream) close() {
+	ps.cancel()
+	if ps.pw != nil {
+		_ = ps.pw.CloseWithError(context.Canceled)
 	}
 }
 

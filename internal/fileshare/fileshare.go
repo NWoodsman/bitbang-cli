@@ -137,7 +137,7 @@ func (f *FileShare) listFiles(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	relPath := r.URL.Query().Get("path")
-	absPath := SafePath(f.BasePath, relPath)
+	absPath := f.resolveForRead(relPath)
 	if absPath == "" {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
@@ -227,7 +227,7 @@ func (f *FileShare) downloadFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	relPath := r.URL.Query().Get("path")
-	absPath := SafePath(f.BasePath, relPath)
+	absPath := f.resolveForRead(relPath)
 	if absPath == "" {
 		http.NotFound(w, r)
 		return
@@ -247,7 +247,7 @@ func (f *FileShare) previewFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	relPath := r.URL.Query().Get("path")
-	absPath := SafePath(f.BasePath, relPath)
+	absPath := f.resolveForRead(relPath)
 	if absPath == "" {
 		http.NotFound(w, r)
 		return
@@ -296,10 +296,14 @@ func (f *FileShare) uploadFile(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Resolve target directory.
+	// resolveForRead rather than SafePath: uploads must not land inside a
+	// hidden directory (.git, .env) any more than reads may come out of one,
+	// and it resolves symlinks so a linked directory can't redirect the
+	// write outside the share.
 	relPath := r.FormValue("path")
 	var targetDir string
 	if relPath != "" {
-		targetDir = SafePath(f.BasePath, relPath)
+		targetDir = f.resolveForRead(relPath)
 	} else {
 		targetDir = f.BasePath
 	}
