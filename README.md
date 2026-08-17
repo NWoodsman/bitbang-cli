@@ -85,7 +85,7 @@ By default, the command prints two bearer URLs:
 `--read-only` omits the control credential entirely. Viewer and controller
 limits are held for each connection's lifetime, even before it opens a shell.
 
-Shares expire after `--ttl` (default `1h`); `--ttl 0` runs until stopped.
+Shares run until stopped by default; `--ttl` sets a lifetime (e.g. `--ttl 1h`).
 Share URLs are ephemeral and are never saved to `devices.json`. `share stop`,
 TTL expiry, or removal of the source session disconnects remote peers without
 stopping the source session.
@@ -255,7 +255,7 @@ bitbang help                           Usage (also --help, -h)
 | Flag               | Default           | Description                                                  |
 | ------------------ | ----------------- | ------------------------------------------------------------ |
 | `-read-only`       | off               | Do not generate a control credential                         |
-| `-ttl DURATION`    | `1h`              | Lifetime up to `8760h`; `0` means until stopped              |
+| `-ttl DURATION`    | `0` (no expiry)   | Lifetime up to `8760h`; `0` means until stopped              |
 | `-target SESSION`  | enclosing session | Session name or `$id`; required when run outside tmux        |
 | `-socket PATH`     | enclosing server  | tmux socket; needed for a non-default server outside tmux    |
 | `-max-viewers N`   | `16`              | Maximum concurrent view-only peers                           |
