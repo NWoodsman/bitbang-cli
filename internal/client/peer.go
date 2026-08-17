@@ -93,28 +93,32 @@ type Peer struct {
 // NewPeer constructs a Peer in URL mode. The UID and code are the values
 // from the URL the user supplied — UID anchors the pubkey/UID check, code
 // rides on the bidirectional-verify payload. forceRelay (from --relay)
-// gathers relay-only.
-func NewPeer(uid, code string, iceServers []webrtc.ICEServer, forceRelay bool) (*Peer, error) {
-	return newPeer(ModeURL, uid, code, iceServers, forceRelay)
+// gathers relay-only. verbose (from -v) restores pion's TURN logging, which
+// is suppressed by default -- see turnlog.go.
+func NewPeer(uid, code string, iceServers []webrtc.ICEServer, forceRelay, verbose bool) (*Peer, error) {
+	return newPeer(ModeURL, uid, code, iceServers, forceRelay, verbose)
 }
 
 // NewPairPeer constructs a Peer in pair mode. The pair flow has no UID
 // or access code at this point — those arrive in pair_approved after SAS
 // verification. Use NewPeer for URL-flow connects where the credentials
 // are already known. (Pairing never forces relay — force_relay isn't wired
-// into the pair flow.)
-func NewPairPeer(iceServers []webrtc.ICEServer) (*Peer, error) {
-	return newPeer(ModePair, "", "", iceServers, false)
+// into the pair flow.) verbose behaves as in NewPeer.
+func NewPairPeer(iceServers []webrtc.ICEServer, verbose bool) (*Peer, error) {
+	return newPeer(ModePair, "", "", iceServers, false, verbose)
 }
 
-func newPeer(mode Mode, uid, code string, iceServers []webrtc.ICEServer, forceRelay bool) (*Peer, error) {
+func newPeer(mode Mode, uid, code string, iceServers []webrtc.ICEServer, forceRelay, verbose bool) (*Peer, error) {
 	cfg := webrtc.Configuration{ICEServers: iceServers}
 	if forceRelay {
 		// --relay: gather and use relay candidates only. Mirrors bootstrap.js
 		// setting iceTransportPolicy:'relay'.
 		cfg.ICETransportPolicy = webrtc.ICETransportPolicyRelay
 	}
-	pc, err := webrtc.NewPeerConnection(cfg)
+	se := webrtc.SettingEngine{}
+	se.LoggerFactory = newQuietTURNLoggerFactory(verbose)
+	api := webrtc.NewAPI(webrtc.WithSettingEngine(se))
+	pc, err := api.NewPeerConnection(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("create peer connection: %w", err)
 	}

@@ -142,7 +142,7 @@ func runPairConnect(code, server string, verbose, relay bool) remoteSpec {
 	// fallback, just like the direct flow, so the hard ~25% would need
 	// force_relay; that isn't wired into pairing yet.)
 	iceServers := icehelper.ParseICEServers(offer)
-	p, err := client.NewPairPeer(iceServers)
+	p, err := client.NewPairPeer(iceServers, verbose)
 	if err != nil {
 		fail("connect: new peer: %v", err)
 	}
