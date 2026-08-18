@@ -1,11 +1,13 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -13,10 +15,12 @@ import (
 
 	qrcode "github.com/skip2/go-qrcode"
 	"golang.org/x/term"
+	"github.com/pion/webrtc/v4"
 
 	"github.com/richlegrand/bitbang/internal/auth"
 	"github.com/richlegrand/bitbang/internal/fileshare"
 	"github.com/richlegrand/bitbang/internal/identity"
+	"github.com/richlegrand/bitbang/internal/icehelper"
 	"github.com/richlegrand/bitbang/internal/pairing"
 	"github.com/richlegrand/bitbang/internal/peer"
 	"github.com/richlegrand/bitbang/internal/proxyweb"
@@ -83,6 +87,11 @@ type serveConfig struct {
 	// Files-cap configuration (only set when filesEnabled).
 	filesPath   string
 	filesUpload bool
+	
+	
+	// ICE server path
+	iceServersPath string
+	iceServers []webrtc.ICEServer
 }
 
 // runServe — `bitbang serve` — exposes shell + files + proxy. The
@@ -182,6 +191,7 @@ func runServeProxy(args []string) {
 	startListener(cfg)
 }
 
+
 // registerSharedFlags wires --pin, --ephemeral, --server, -v on every
 // mode. They have the same semantics across all four runServe*
 // functions, so factor them out.
@@ -195,6 +205,7 @@ func registerSharedFlags(fs *flag.FlagSet, cfg *serveConfig) {
 	fs.StringVar(&cfg.program, "program", "", "Identity program-name override; default is derived from the mode/target (key at ~/.bitbang/<program>/identity.pem)")
 	fs.StringVar(&cfg.target, "target", "", "Fixed proxy target host:port (proxy-only mode); empty = dynamic from URL")
 	fs.BoolVar(&cfg.forwardClientIP, "forward-client-ip", false, "Stamp the real browser IP as X-Forwarded-For (fixed-target mode); enable only when the backend trusts localhost for auth")
+	fs.StringVar(&cfg.iceServersPath, "ice-servers", "", "Path to the custom JSON ICE server configuration file")
 }
 
 // registerShellFlags wires the shell-specific flags. Used by both
@@ -284,6 +295,48 @@ func startListener(cfg serveConfig) {
 	if cfg.shellCmd != "" {
 		shellArgv = []string{cfg.shellCmd}
 	}
+	
+	
+	if cfg.iceServersPath != "" {
+		
+		var cleanedPath string
+		
+		cleanedPath = filepath.Clean(cfg.iceServersPath)
+		
+		if !filepath.IsAbs(cleanedPath) {
+			
+			currentDir, err := os.Getwd()
+			
+			if err != nil {
+				fmt.Printf("Error getting working directory during ICE file parsing: %v\n",err)
+				os.Exit(1)
+			}
+			
+			cleanedPath = filepath.Join(currentDir,cleanedPath)
+		}
+		
+		fileBytes, err := os.ReadFile(cleanedPath)
+		
+		if err != nil {
+			fmt.Printf("Error reading ICE server file: %v\n", err)
+			os.Exit(1)
+		}
+
+	
+		msg := make(map[string]interface{})
+
+			
+		err = json.Unmarshal(fileBytes, &msg)
+		if err != nil {
+			fmt.Printf("Error parsing JSON content: %v\n", err)
+			os.Exit(1)
+		}
+
+		cfg.iceServers = icehelper.ParseICEServers(msg)
+		
+	}
+	
+		
 
 	pinAuth := auth.New(cfg.pin)
 
@@ -337,8 +390,16 @@ func startListener(cfg serveConfig) {
 
 	httpFront := buildServeHTTPHandler(share, cfg.shellEnabled, cfg.proxyEnabled,
 		cfg.shellMaxSessions, isAllMode(cfg))
+		
+	
+	var signalingClient *signaling.Client		
+	
+	if cfg.iceServers != nil {
+		signalingClient = signaling.NewClient_WithICE(cfg.server, id, &cfg.iceServers)
+	} else {
+		signalingClient = signaling.NewClient(cfg.server, id)
+	}
 
-	signalingClient := signaling.NewClient(cfg.server, id)
 	signalingClient.Verbose = cfg.verbose
 	signalingClient.WantCode = !cfg.nocode
 	// Override the library default: for a CLI listener, the right
