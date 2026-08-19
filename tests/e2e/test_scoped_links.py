@@ -13,6 +13,7 @@ stream type and so where getting the split wrong would be invisible.
 import os
 
 import pytest
+from playwright.sync_api import expect
 
 
 @pytest.fixture(scope='module')
@@ -85,8 +86,15 @@ def test_unscoped_link_can_reach_a_lan_host(scoped, browser_context, target_app)
 
 def test_revoking_a_link_closes_the_browser_session(scoped, browser_context):
     """Deleting an entry closes the sessions using it, rather than only
-    barring the next connection. The browser is told why on stream 0 and
-    renders it, which is the path the CLI client had been dropping."""
+    barring the next connection -- and the browser says why.
+
+    The saying-why half is easy to get wrong invisibly. The device iframe
+    is position:fixed, full viewport and opaque, so a message printed into
+    #connection-ui underneath it cannot be seen; and the channel closing
+    behind the message routes into the reconnect loop, which would leave
+    "Reconnecting..." on screen for a session that ended on purpose. So
+    assert what the user actually ends up looking at.
+    """
     l, urls = scoped
     page = browser_context.new_page()
     page.goto(urls['contractor'], wait_until='networkidle')
@@ -94,4 +102,11 @@ def test_revoking_a_link_closes_the_browser_session(scoped, browser_context):
 
     l.write_links([])  # revoke every link but the implicit one
     l.wait_for(r'Closing .*link "contractor" was deleted', timeout=90)
+
+    ui = page.locator('#connection-ui')
+    expect(ui).to_contain_text('this link was revoked', timeout=30000)
+    expect(page.locator('#bb-reload-btn')).to_be_visible()
+    # The iframe has to be out of the way, or the message above is being
+    # asserted on an element nobody can see.
+    expect(page.locator('#device-frame')).to_be_hidden()
     page.close()

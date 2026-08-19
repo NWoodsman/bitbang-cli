@@ -5,9 +5,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/richlegrand/bitbang/internal/auth"
 	"github.com/richlegrand/bitbang/internal/fileshare"
 	"github.com/richlegrand/bitbang/internal/identity"
 	"github.com/richlegrand/bitbang/internal/links"
+	"github.com/richlegrand/bitbang/internal/session"
 )
 
 // Today a files-only listener cannot become a shell because it has no
@@ -215,4 +217,37 @@ func contains(haystack []string, needle string) bool {
 		}
 	}
 	return false
+}
+
+// The ordering inside revoke is what an e2e run caught: sending the
+// goodbye and closing the connection in one breath discards the frame
+// pion still has queued, and the connector reconnects instead of being
+// told why. The session must be dead at once -- that is the security
+// half -- while the connection lingers just long enough for the message
+// to leave.
+func TestRevoke_ClosesSessionAtOnceAndConnectionAfter(t *testing.T) {
+	p := peerOn(links.Terms{Label: "contractor", Code: "C"})
+	sess := session.New(nil, auth.New(""), false)
+	if !p.admit(sess, sessionHandlers{}) {
+		t.Fatal("admit refused a live peer")
+	}
+
+	pollPeers([]*servePeer{p}, tableWith(t, nil), time.Now())
+
+	// Immediately: the session serves nothing further.
+	if !sess.Closed() {
+		t.Error("session still live right after revocation; it could still open streams")
+	}
+	// The connection follows once the goodbye has had its moment.
+	if p.q.IsClosed() {
+		t.Error("connection closed synchronously, before the goodbye could leave")
+	}
+	deadline := time.Now().Add(revokeGrace + 2*time.Second)
+	for time.Now().Before(deadline) {
+		if p.q.IsClosed() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Error("connection was never torn down after revocation")
 }
