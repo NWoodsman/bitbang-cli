@@ -15,6 +15,7 @@ import (
 	"github.com/richlegrand/bitbang/internal/auth"
 	"github.com/richlegrand/bitbang/internal/identity"
 	"github.com/richlegrand/bitbang/internal/peer"
+	"github.com/richlegrand/bitbang/internal/peerset"
 	"github.com/richlegrand/bitbang/internal/protocol"
 	"github.com/richlegrand/bitbang/internal/session"
 	"github.com/richlegrand/bitbang/internal/shellweb"
@@ -80,8 +81,11 @@ type Worker struct {
 	control     *roleSlots
 	viewers     *roleSlots
 
+	// peers owns registration, the concurrent-peer ceiling, and the
+	// shutdown drain. Separate from mu, which guards the fields below.
+	peers *peerset.Set[*sharePeer]
+
 	mu        sync.Mutex
-	peers     map[string]*sharePeer
 	closed    bool
 	startedAt time.Time
 	expiresAt time.Time
@@ -151,7 +155,7 @@ func NewWorker(cfg WorkerConfig) (*Worker, error) {
 		viewWeb:     shellweb.New(shellweb.WithViewOnly()).HTTPHandler(),
 		control:     newRoleSlots(1, "share already has a controller -- try again after they disconnect"),
 		viewers:     newRoleSlots(cfg.MaxViewers, fmt.Sprintf("share is full (max %d viewers)", cfg.MaxViewers)),
-		peers:       make(map[string]*sharePeer),
+		peers:       peerset.New[*sharePeer](),
 		errs:        make(chan error, 1),
 	}
 	if cfg.ReadOnly {
@@ -334,12 +338,10 @@ func (w *Worker) handleRequest(msg signaling.Message) {
 		return
 	}
 
-	w.mu.Lock()
+	// A cheap pre-check before building a connection; AddLimited below is
+	// the one that actually decides, atomically.
 	maxPeers := w.cfg.MaxViewers + 5
-	full := w.closed || len(w.peers) >= maxPeers
-	_, duplicate := w.peers[clientID]
-	w.mu.Unlock()
-	if full || duplicate {
+	if w.peers.Len() >= maxPeers || w.peers.Has(clientID) {
 		log.Printf("Rejecting %s: share is at its connection limit or client ID is already active", clientID)
 		return
 	}
@@ -353,14 +355,10 @@ func (w *Worker) handleRequest(msg signaling.Message) {
 	p.setConn(conn)
 	conn.Authorize = w.authorize
 
-	w.mu.Lock()
-	if w.closed || len(w.peers) >= maxPeers || w.peers[clientID] != nil {
-		w.mu.Unlock()
+	if !w.peers.AddLimited(clientID, p, maxPeers) {
 		conn.Close()
 		return
 	}
-	w.peers[clientID] = p
-	w.mu.Unlock()
 
 	conn.SetOnClose(func() { w.dropPeer(clientID, p, "connection closed") })
 	p.armEstablishment(peerEstablishTimeout, func() {
@@ -401,12 +399,8 @@ func (w *Worker) handleCandidate(msg signaling.Message) {
 }
 
 func (w *Worker) peer(clientID string) *sharePeer {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if w.closed {
-		return nil
-	}
-	return w.peers[clientID]
+	p, _ := w.peers.Get(clientID)
+	return p
 }
 
 // buildSession admits an authorized peer: it pins the peer to the tmux
@@ -493,11 +487,7 @@ func (w *Worker) dropPeer(clientID string, p *sharePeer, why string) {
 	if !p.teardown() {
 		return
 	}
-	w.mu.Lock()
-	if w.peers[clientID] == p {
-		delete(w.peers, clientID)
-	}
-	w.mu.Unlock()
+	w.peers.Forget(clientID, p)
 	log.Printf("Peer %s gone: %s", clientID, why)
 }
 
@@ -511,12 +501,8 @@ func (w *Worker) shutdown() {
 		return
 	}
 	w.closed = true
-	peers := make([]*sharePeer, 0, len(w.peers))
-	for _, p := range w.peers {
-		peers = append(peers, p)
-	}
-	w.peers = make(map[string]*sharePeer)
 	w.mu.Unlock()
+	peers := w.peers.Close()
 
 	w.signaling.Stop()
 	var wg sync.WaitGroup

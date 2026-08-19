@@ -7,6 +7,7 @@ import (
 	"github.com/richlegrand/bitbang/internal/framequeue"
 	"github.com/richlegrand/bitbang/internal/links"
 	"github.com/richlegrand/bitbang/internal/peer"
+	"github.com/richlegrand/bitbang/internal/peerset"
 	"github.com/richlegrand/bitbang/internal/session"
 	"github.com/richlegrand/bitbang/internal/streamtype"
 	"github.com/richlegrand/bitbang/internal/videohelper"
@@ -26,7 +27,7 @@ type servePeer struct {
 	q        *framequeue.Queue
 
 	conn     *peer.Connection
-	deadline *deadlineGuard
+	deadline *peerset.Deadline
 	// browserIP is the connecting browser's IP as reported by the
 	// signaling server, needed when the handler set is built later.
 	browserIP string

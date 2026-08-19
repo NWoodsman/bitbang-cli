@@ -7,23 +7,14 @@ import (
 	"net/http"
 	"os"
 	"strings"
-	"sync"
-	"sync/atomic"
-	"time"
-	"unicode/utf8"
 
 	qrcode "github.com/skip2/go-qrcode"
-	"golang.org/x/term"
 
 	"github.com/richlegrand/bitbang/internal/auth"
 	"github.com/richlegrand/bitbang/internal/fileshare"
 	"github.com/richlegrand/bitbang/internal/identity"
-	"github.com/richlegrand/bitbang/internal/links"
-	"github.com/richlegrand/bitbang/internal/pairing"
-	"github.com/richlegrand/bitbang/internal/peer"
-	"github.com/richlegrand/bitbang/internal/protocol"
+	"github.com/richlegrand/bitbang/internal/peerset"
 	"github.com/richlegrand/bitbang/internal/proxyweb"
-	"github.com/richlegrand/bitbang/internal/session"
 	"github.com/richlegrand/bitbang/internal/shellweb"
 	"github.com/richlegrand/bitbang/internal/signaling"
 	"github.com/richlegrand/bitbang/internal/streamtype"
@@ -364,136 +355,37 @@ func startListener(cfg serveConfig) {
 		fmt.Fprintf(os.Stderr, "Link table error: %v\n", err)
 		os.Exit(1)
 	}
-	currentTable := linkState.current
 
-	stdoutIsTTY := term.IsTerminal(int(os.Stdout.Fd()))
-	termWidth := 0
-	if w, _, err := term.GetSize(int(os.Stdout.Fd())); err == nil {
-		termWidth = w
-	}
-	bold, reset := "", ""
-	if stdoutIsTTY {
-		bold, reset = "\033[1m", "\033[0m"
-	}
-
-	// printReady renders the banner, QR code, and URL. On a wide TTY the
-	// banner sits to the right of the QR (vertically centered) so the whole
-	// startup block stays short enough to fit on one screen — handy for a
-	// screen recording. On a narrow or non-TTY output it falls back to the
-	// banner stacked above the QR so pipes, logs, and tests stay readable.
-	printReady := func() {
-		qr := smallQR(url)
-		bannerLines := strings.Split(strings.TrimRight(banner, "\n"), "\n")
-		bannerLines = append(bannerLines, "bitbang-cli v"+version)
-		var qrLines []string
-		if qr != "" {
-			qrLines = strings.Split(strings.TrimRight(qr, "\n"), "\n")
-		}
-
-		bannerWidth := 0
-		for _, l := range bannerLines {
-			if w := utf8.RuneCountInString(l); w > bannerWidth {
-				bannerWidth = w
-			}
-		}
-		const gap = "   "
-		qrWidth := 0
-		if len(qrLines) > 0 {
-			qrWidth = utf8.RuneCountInString(qrLines[0])
-		}
-
-		if len(qrLines) > 0 && stdoutIsTTY && termWidth >= qrWidth+len(gap)+bannerWidth {
-			// QR flush left keeps its quiet zone against the terminal margin;
-			// the banner is centered vertically against the taller QR block.
-			off := (len(qrLines) - len(bannerLines)) / 2
-			if off < 0 {
-				off = 0
-			}
-			for i, ql := range qrLines {
-				if bi := i - off; bi >= 0 && bi < len(bannerLines) {
-					fmt.Println(ql + gap + bannerLines[bi])
-				} else {
-					fmt.Println(ql)
-				}
-			}
-		} else {
-			for _, l := range bannerLines {
-				fmt.Println(l)
-			}
-			fmt.Println()
-			fmt.Print(qr)
-		}
-		fmt.Printf("URL: %s%s%s\n", bold, url, reset)
-	}
-
-	// printPairCode renders the issued pairing code on its own line —
-	// the operator shares this verbally so the connector can pair
-	// without the full UID URL. Code may be empty when (a) --nocode is
-	// set, or (b) the server lacks pairing support. In either case the
-	// URL flow still works; we just don't surface a code. Bolded on a
-	// TTY so it's easy to spot in the startup block; plain on pipes
-	// so log scrapers/tests aren't confused by escape sequences.
-	printPairCode := func() {
-		if signalingClient.PairingCode != "" {
-			fmt.Printf("%sPairing code: %s%s (valid 5 minutes)\n", bold, signalingClient.PairingCode, reset)
-		}
-	}
-
-	printReady()
+	out := newConsole(url)
+	out.ready()
 	printSharingBlock(cfg, share)
 
 	// PIN status / shell-without-PIN warning.
 	if pinAuth.Required() {
 		fmt.Println("PIN protection enabled.")
 	} else if cfg.shellEnabled {
-		fmt.Fprintf(os.Stderr, "%sWarning: anyone with this URL gets a shell and unrestricted TCP access from this machine.%s\n", bold, reset)
+		fmt.Fprintf(os.Stderr, "%sWarning: anyone with this URL gets a shell and unrestricted TCP access from this machine.%s\n", out.bold, out.reset)
 		fmt.Fprintln(os.Stderr, "  Use --pin <PIN> for a second factor, or pick a non-shell mode.")
 	}
 
-	if listing := linkState.listing(bold, reset); listing != "" {
+	if listing := linkState.listing(out.bold, out.reset); listing != "" {
 		fmt.Print(listing)
 		fmt.Print(reloadHint())
 	}
 
-	var mu sync.Mutex
-	connections := make(map[string]*servePeer)
-
-	forget := func(clientID string, p *servePeer) {
-		mu.Lock()
-		if connections[clientID] == p {
-			delete(connections, clientID)
-		}
-		mu.Unlock()
-	}
-	livePeers := func() []*servePeer {
-		mu.Lock()
-		defer mu.Unlock()
-		out := make([]*servePeer, 0, len(connections))
-		for _, p := range connections {
-			out = append(out, p)
-		}
-		return out
+	l := &listener{
+		cfg:       cfg,
+		id:        id,
+		share:     share,
+		shellArgv: shellArgv,
+		pinAuth:   pinAuth,
+		signaling: signalingClient,
+		links:     linkState,
+		video:     videoClient,
+		peers:     peerset.New[*servePeer](),
 	}
 
-	// unauthSessions counts live sessions that haven't completed the PIN
-	// handshake. Bounds parallel brute-force; released on auth or close.
-	var unauthSessions atomic.Int32
-
-	poll := func(now time.Time) { pollPeers(livePeers(), currentTable(), now) }
-	watchReload(func() {
-		if err := linkState.reload(); err != nil {
-			// The previous table stays in force: an unreadable file must
-			// never degrade to "no links", which grants everything.
-			fmt.Fprintf(os.Stderr, "Reload failed, keeping the previous links: %v\n", err)
-			return
-		}
-		if listing := linkState.listing(bold, reset); listing != "" {
-			fmt.Print(listing)
-			fmt.Print(reloadHint())
-		}
-		poll(time.Now())
-	})
-	watchExpiry(linkPoll, poll)
+	l.watch(out.bold, out.reset)
 
 	firstReady := true
 	signalingClient.OnReady = func() {
@@ -502,223 +394,16 @@ func startListener(cfg serveConfig) {
 			// First-ready: URL/QR was already printed above (synchronously,
 			// before Connect). Print just the pair code now that we've
 			// learned it from the registered reply.
-			printPairCode()
+			out.pairCode(signalingClient.PairingCode)
 			return
 		}
 		// Reconnect: re-print URL+QR (operator may have scrolled past it
 		// during a long-running session) and the freshly-issued code.
-		printReady()
-		printPairCode()
+		out.ready()
+		out.pairCode(signalingClient.PairingCode)
 	}
 
-	signalingClient.Connect(func(msg signaling.Message) {
-		msgType, _ := msg["type"].(string)
-
-		switch msgType {
-		case "request":
-			clientID, _ := msg["client_id"].(string)
-			mu.Lock()
-			duplicate := connections[clientID] != nil
-			mu.Unlock()
-			if clientID == "" || duplicate {
-				log.Printf("Rejecting duplicate or empty client ID %q", clientID)
-				return
-			}
-			// Real browser IP from the signaling server (never client-set);
-			// stamped as X-Forwarded-For on proxied requests so the backend
-			// sees the true origin instead of our localhost socket peer.
-			browserIP, _ := msg["browser_ip"].(string)
-
-			// Cap concurrent un-authenticated sessions to blunt parallel
-			// PIN brute-forcing. A connector must already hold the access
-			// code to get this far, but without a cap they could open many
-			// sessions at once and guess PINs in parallel. Authenticated
-			// sessions release their slot (see OnReady below), so legit
-			// users never hit this.
-			if unauthSessions.Load() >= maxUnauthSessions {
-				log.Printf("Rejecting connection from %s: too many pending sessions (%d)", clientID, maxUnauthSessions)
-				return
-			}
-
-			p := newServePeer(clientID)
-			p.browserIP = browserIP
-
-			conn, err := peer.HandleRequest(msg, signalingClient, id, p.q.Enqueue, cfg.verbose)
-			if err != nil {
-				log.Printf("Failed to create peer connection: %v", err)
-				return
-			}
-			p.conn = conn
-			p.q.SetConn(conn)
-
-			// Resolve the presented code against the table as it stands
-			// now. Set here, after HandleRequest and before the answer
-			// arrives, which is the only window there is: the code rides
-			// on the answer, so nothing before this point knows what the
-			// connector may reach.
-			conn.Authorize = func(code string) (protocol.Access, bool) {
-				terms, ok := currentTable().Authorize(code, time.Now())
-				if !ok {
-					return protocol.AccessDefault, false
-				}
-				p.grant(terms)
-				return protocol.AccessDefault, true
-			}
-
-			// Count this session against the unauth cap; release the slot
-			// exactly once, whichever comes first: it authenticates
-			// (OnReady) or it closes. sync.Once makes the double-path
-			// idempotent.
-			unauthSessions.Add(1)
-			var releaseOnce sync.Once
-			p.release = func() { releaseOnce.Do(func() { unauthSessions.Add(-1) }) }
-
-			// Neither release path can be reached by a peer that requests
-			// a connection and then goes quiet: with no SDP answer the
-			// connection never leaves WebRTC's `new` state, so there is no
-			// data channel to close and no terminal state to observe.
-			// Without a deadline, maxUnauthSessions such peers wedge the
-			// listener for good.
-			p.deadline = newDeadlineGuard(unreadyPeerTimeout, func() {
-				log.Printf("Dropping %s: handshake not completed within %s", clientID, unreadyPeerTimeout)
-				p.close()
-			})
-
-			// The video bridge does not depend on scope, so it is built
-			// with the request and attached when the session appears.
-			if videoClient != nil {
-				// Forward the data PC's ICE servers so the video PC can use
-				// the same STUN/TURN (needed for peers with no direct path).
-				var iceServers []map[string]interface{}
-				if raw, ok := msg["ice_servers"].([]interface{}); ok {
-					for _, srv := range raw {
-						if m, ok := srv.(map[string]interface{}); ok {
-							iceServers = append(iceServers, m)
-						}
-					}
-				}
-				p.bridge = videoClient.Bridge(clientID, iceServers)
-			}
-
-			mu.Lock()
-			connections[clientID] = p
-			mu.Unlock()
-			conn.SetOnClose(func() {
-				p.close()
-				forget(clientID, p)
-			})
-
-		case "answer":
-			clientID, _ := msg["client_id"].(string)
-			sdp, _ := msg["sdp"].(string)
-			mu.Lock()
-			p := connections[clientID]
-			mu.Unlock()
-			if p == nil {
-				return
-			}
-			// Pair-flow answers skip the bidirectional-verify decrypt —
-			// SAS comparison (run from the data-channel OnOpen) is the
-			// substitute, since the connector doesn't hold an access
-			// code yet to feed encrypted_request with.
-			if p.conn.PairingMode {
-				if err := p.conn.HandlePairAnswer(sdp); err != nil {
-					log.Printf("Failed to handle pair answer: %v", err)
-					p.close()
-				}
-				return
-			}
-			encrypted, _ := msg["encrypted_request"].(string)
-			if err := p.conn.HandleAnswer(sdp, encrypted); err != nil {
-				log.Printf("Failed to handle answer: %v", err)
-				p.close()
-				return
-			}
-
-			// Authorize ran inside HandleAnswer, so the terms are known.
-			// Build the handler set from what they grant, rather than
-			// building everything and checking later: sendReady derives
-			// advertised caps from the set, and OnConnect never runs for a
-			// handler that was never built.
-			label, terms := p.granted()
-			if label == "" {
-				log.Printf("Dropping %s: answer accepted with no terms resolved", clientID)
-				p.close()
-				return
-			}
-			granted := terms.GrantSet(offeredScopes(cfg))
-			h := buildHandlers(cfg, granted, share, shellArgv, id, p.browserIP)
-
-			sess := session.New(p.conn.DC, pinAuth, cfg.verbose, h.all...)
-			sess.OnReady = func() {
-				p.deadline.Done()
-				p.release()
-			}
-			if p.bridge != nil {
-				sess.SetVideoBridge(p.bridge)
-			}
-			if !p.admit(sess, h) {
-				// Teardown won the race; nothing published, so close the
-				// session we just built rather than leaking it.
-				sess.Close()
-				return
-			}
-			if label != links.MeLabel {
-				log.Printf("Peer %s authorized on link %q (%v)", clientID, label, terms.Grants(offeredScopes(cfg)))
-			}
-
-		case "pair_request":
-			clientID, _ := msg["client_id"].(string)
-			if clientID == "" {
-				return
-			}
-			mu.Lock()
-			duplicate := connections[clientID] != nil
-			mu.Unlock()
-			if duplicate {
-				log.Printf("Rejecting duplicate pair client ID %q", clientID)
-				return
-			}
-			conn, err := peer.HandlePairRequest(msg, signalingClient, id,
-				pairing.DefaultTTYPrompt, cfg.verbose)
-			if err != nil {
-				log.Printf("Failed to handle pair request: %v", err)
-				return
-			}
-			// Pairing is unscoped: PairingMode skips the access-code check
-			// entirely, so no terms are ever resolved for this peer and the
-			// poll leaves it alone. It also never gets a session here --
-			// the handshake delivers a code the connector reconnects with.
-			p := newServePeer(clientID)
-			p.conn = conn
-			p.q.SetConn(conn)
-			mu.Lock()
-			connections[clientID] = p
-			mu.Unlock()
-			p.deadline = newDeadlineGuard(unreadyPeerTimeout, func() {
-				log.Printf("Dropping pair %s: handshake not completed within %s", clientID, unreadyPeerTimeout)
-				p.close()
-			})
-			conn.SetOnClose(func() {
-				p.close()
-				forget(clientID, p)
-			})
-
-		case "candidate":
-			clientID, _ := msg["client_id"].(string)
-			candidateData, _ := msg["candidate"].(map[string]interface{})
-			mu.Lock()
-			p := connections[clientID]
-			mu.Unlock()
-			if p == nil {
-				return
-			}
-			_ = p.conn.AddICECandidate(candidateData)
-
-		case "error":
-			log.Printf("Signaling error: %v", msg["message"])
-		}
-	})
+	signalingClient.Connect(l.handleSignal)
 }
 
 // launcherCapBarItems composes the dropdown for the all-mode launcher

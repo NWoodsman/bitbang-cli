@@ -6,6 +6,7 @@ import (
 
 	"github.com/richlegrand/bitbang/internal/framequeue"
 	"github.com/richlegrand/bitbang/internal/peer"
+	"github.com/richlegrand/bitbang/internal/peerset"
 	"github.com/richlegrand/bitbang/internal/session"
 	"github.com/richlegrand/bitbang/internal/streamtype"
 )
@@ -24,7 +25,7 @@ type sharePeer struct {
 	shell         *streamtype.ShellHandler
 	session       *session.Session
 	releases      []func()
-	establishment *time.Timer
+	establishment *peerset.Deadline
 	refusal       *time.Timer
 }
 
@@ -76,7 +77,7 @@ func (p *sharePeer) isClosed() bool { return p.q.IsClosed() }
 func (p *sharePeer) armEstablishment(after time.Duration, expire func()) {
 	p.q.Locked(func(closed bool) {
 		if !closed {
-			p.establishment = time.AfterFunc(after, expire)
+			p.establishment = peerset.NewDeadline(after, expire)
 		}
 	})
 }
@@ -86,10 +87,7 @@ func (p *sharePeer) armEstablishment(after time.Duration, expire func()) {
 // completes over an open data channel.
 func (p *sharePeer) markEstablished() {
 	p.q.Locked(func(bool) {
-		if p.establishment != nil {
-			p.establishment.Stop()
-			p.establishment = nil
-		}
+		p.establishment.Done()
 	})
 }
 
@@ -114,9 +112,7 @@ func (p *sharePeer) armRefusal(after time.Duration, expire func()) {
 // handler, or publish finds the peer closed and declines.
 func (p *sharePeer) teardown() bool {
 	return p.q.Close(func() func() {
-		if p.establishment != nil {
-			p.establishment.Stop()
-		}
+		p.establishment.Done()
 		if p.refusal != nil {
 			p.refusal.Stop()
 		}
