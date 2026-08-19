@@ -14,6 +14,7 @@ import (
 
 	"github.com/richlegrand/bitbang/internal/icehelper"
 	"github.com/richlegrand/bitbang/internal/sdp"
+	"github.com/richlegrand/bitbang/internal/turnlog"
 )
 
 // Mode is the verification posture this Peer takes for the offer it
@@ -116,7 +117,7 @@ func newPeer(mode Mode, uid, code string, iceServers []webrtc.ICEServer, forceRe
 		cfg.ICETransportPolicy = webrtc.ICETransportPolicyRelay
 	}
 	se := webrtc.SettingEngine{}
-	se.LoggerFactory = newQuietTURNLoggerFactory(verbose)
+	turnlog.Install(&se, verbose)
 	api := webrtc.NewAPI(webrtc.WithSettingEngine(se))
 	pc, err := api.NewPeerConnection(cfg)
 	if err != nil {

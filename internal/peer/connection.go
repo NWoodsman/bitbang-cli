@@ -30,6 +30,7 @@ import (
 	"github.com/richlegrand/bitbang/internal/pairing"
 	"github.com/richlegrand/bitbang/internal/protocol"
 	"github.com/richlegrand/bitbang/internal/signaling"
+	"github.com/richlegrand/bitbang/internal/turnlog"
 )
 
 // relayAcceptanceMinWait is how long the device's (ICE-controlling) pion agent
@@ -238,6 +239,7 @@ func setupConnection(s connSetup) (*Connection, error) {
 	se := webrtc.SettingEngine{}
 	se.SetRelayAcceptanceMinWait(relayWaitFor(s.msg))
 	se.SetICEMaxBindingRequests(iceMaxBindingRequests)
+	turnlog.Install(&se, s.verbose)
 	api := webrtc.NewAPI(webrtc.WithSettingEngine(se))
 
 	pc, err := api.NewPeerConnection(webrtc.Configuration{ICEServers: iceServers})
