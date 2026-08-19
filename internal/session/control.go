@@ -256,6 +256,13 @@ func (s *Session) sendReady() {
 	}
 }
 
+// SendError puts a stream-0 error on the wire, naming why the listener
+// is about to drop this session. Callers outside the handshake use it to
+// say goodbye before closing: the browser bootstrap renders a stream-0
+// error at any point in a session, and the CLI client surfaces one from
+// its post-handshake control handler.
+func (s *Session) SendError(message string) { s.sendControlError(message) }
+
 func (s *Session) sendControlError(message string) {
 	errMsg, _ := json.Marshal(map[string]string{
 		"type":    "error",

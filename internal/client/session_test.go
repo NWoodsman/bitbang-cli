@@ -1,8 +1,10 @@
 package client
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -652,5 +654,33 @@ func waitResult(t *testing.T, result <-chan error) error {
 	case <-time.After(time.Second):
 		t.Fatal("operation did not finish")
 		return nil
+	}
+}
+
+// A listener that revokes a link mid-session says why on stream 0. The
+// handshake loop has its own "error" case, but by then the handshake is
+// long over -- without a post-handshake case the message is dropped and
+// the user just sees the connection vanish.
+func TestPostHandshakeErrorIsSurfaced(t *testing.T) {
+	var out bytes.Buffer
+	old := stderr
+	stderr = &out
+	t.Cleanup(func() { stderr = old })
+
+	s := &Session{
+		streams: make(map[uint32]*stream),
+		done:    make(chan struct{}),
+	}
+	payload := []byte(`{"type":"error","message":"this link has expired"}`)
+	if !s.handleControl(protocol.Frame{StreamID: 0, Flags: protocol.FlagSYN, Payload: payload}) {
+		t.Fatal("post-handshake error was not handled")
+	}
+	if got := out.String(); !strings.Contains(got, "this link has expired") {
+		t.Errorf("stderr = %q, want the listener's reason", got)
+	}
+	select {
+	case <-s.done:
+	default:
+		t.Error("the session was left open after the listener ended it")
 	}
 }

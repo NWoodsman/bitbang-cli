@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 	"unicode/utf8"
 
 	qrcode "github.com/skip2/go-qrcode"
@@ -17,8 +18,10 @@ import (
 	"github.com/richlegrand/bitbang/internal/auth"
 	"github.com/richlegrand/bitbang/internal/fileshare"
 	"github.com/richlegrand/bitbang/internal/identity"
+	"github.com/richlegrand/bitbang/internal/links"
 	"github.com/richlegrand/bitbang/internal/pairing"
 	"github.com/richlegrand/bitbang/internal/peer"
+	"github.com/richlegrand/bitbang/internal/protocol"
 	"github.com/richlegrand/bitbang/internal/proxyweb"
 	"github.com/richlegrand/bitbang/internal/session"
 	"github.com/richlegrand/bitbang/internal/shellweb"
@@ -26,6 +29,9 @@ import (
 	"github.com/richlegrand/bitbang/internal/streamtype"
 	"github.com/richlegrand/bitbang/internal/videohelper"
 )
+
+// defaultServer is the signaling host every command defaults to.
+const defaultServer = "bitba.ng"
 
 // maxUnauthSessions bounds how many sessions may sit pre-PIN-auth at once,
 // limiting parallel brute-force. A single human needs exactly one.
@@ -186,7 +192,7 @@ func runServeProxy(args []string) {
 // mode. They have the same semantics across all four runServe*
 // functions, so factor them out.
 func registerSharedFlags(fs *flag.FlagSet, cfg *serveConfig) {
-	fs.StringVar(&cfg.server, "server", "bitba.ng", "Signaling server hostname")
+	fs.StringVar(&cfg.server, "server", defaultServer, "Signaling server hostname")
 	fs.StringVar(&cfg.pin, "pin", "", "PIN to protect access")
 	fs.BoolVar(&cfg.ephemeral, "ephemeral", false, "Use a temporary identity")
 	fs.BoolVar(&cfg.verbose, "v", false, "Verbose logging")
@@ -335,9 +341,6 @@ func startListener(cfg serveConfig) {
 		log.Printf("Video helper attached on fd %d", cfg.videoFD)
 	}
 
-	httpFront := buildServeHTTPHandler(share, cfg.shellEnabled, cfg.proxyEnabled,
-		cfg.shellMaxSessions, isAllMode(cfg))
-
 	signalingClient := signaling.NewClient(cfg.server, id)
 	signalingClient.Verbose = cfg.verbose
 	signalingClient.WantCode = !cfg.nocode
@@ -350,6 +353,18 @@ func startListener(cfg serveConfig) {
 		os.Exit(2)
 	}
 	url := signalingClient.URL(cfg.verbose)
+
+	// The link table lives beside the identity, so it is per program:
+	// `serve files -files /srv` and `serve all` derive different program
+	// names and therefore have separate tables. An ephemeral identity has
+	// no directory to keep one in, so it runs on the implicit row alone.
+	linkState, err := newLinkState(program, offeredScopes(cfg), id.Code,
+		cfg.ephemeral, signalingClient.CodeURL)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Link table error: %v\n", err)
+		os.Exit(1)
+	}
+	currentTable := linkState.current
 
 	stdoutIsTTY := term.IsTerminal(int(os.Stdout.Fd()))
 	termWidth := 0
@@ -435,12 +450,50 @@ func startListener(cfg serveConfig) {
 		fmt.Fprintln(os.Stderr, "  Use --pin <PIN> for a second factor, or pick a non-shell mode.")
 	}
 
+	if listing := linkState.listing(bold, reset); listing != "" {
+		fmt.Print(listing)
+		fmt.Print(reloadHint())
+	}
+
 	var mu sync.Mutex
-	connections := make(map[string]*peer.Connection)
+	connections := make(map[string]*servePeer)
+
+	forget := func(clientID string, p *servePeer) {
+		mu.Lock()
+		if connections[clientID] == p {
+			delete(connections, clientID)
+		}
+		mu.Unlock()
+	}
+	livePeers := func() []*servePeer {
+		mu.Lock()
+		defer mu.Unlock()
+		out := make([]*servePeer, 0, len(connections))
+		for _, p := range connections {
+			out = append(out, p)
+		}
+		return out
+	}
 
 	// unauthSessions counts live sessions that haven't completed the PIN
 	// handshake. Bounds parallel brute-force; released on auth or close.
 	var unauthSessions atomic.Int32
+
+	poll := func(now time.Time) { pollPeers(livePeers(), currentTable(), now) }
+	watchReload(func() {
+		if err := linkState.reload(); err != nil {
+			// The previous table stays in force: an unreadable file must
+			// never degrade to "no links", which grants everything.
+			fmt.Fprintf(os.Stderr, "Reload failed, keeping the previous links: %v\n", err)
+			return
+		}
+		if listing := linkState.listing(bold, reset); listing != "" {
+			fmt.Print(listing)
+			fmt.Print(reloadHint())
+		}
+		poll(time.Now())
+	})
+	watchExpiry(linkPoll, poll)
 
 	firstReady := true
 	signalingClient.OnReady = func() {
@@ -487,159 +540,131 @@ func startListener(cfg serveConfig) {
 				return
 			}
 
-			var handlers []streamtype.StreamHandler
-			if share != nil {
-				handlers = append(handlers, streamtype.NewFile(share, cfg.verbose))
-			}
-			var shellHandler *streamtype.ShellHandler
-			var tcpHandler *streamtype.TCPHandler
-			if cfg.shellEnabled {
-				shellHandler = streamtype.NewShell(shellArgv, cfg.verbose)
-				shellHandler.MaxConcurrent = cfg.shellMaxSessions
-				if cfg.shellMirror {
-					shellHandler.StdoutMirror = os.Stdout
-					shellHandler.StderrMirror = os.Stderr
-				}
-				handlers = append(handlers, shellHandler)
-				tcpHandler = streamtype.NewTCP(cfg.verbose)
-				handlers = append(handlers, tcpHandler)
-			}
-			// Fixed-target proxy-only mode (e.g. the OctoPrint plugin): every
-			// request goes straight to --target, so the plain device URL serves
-			// the app directly — no dispatcher, no landing page.
-			if cfg.proxyEnabled && cfg.target != "" && !cfg.shellEnabled && !cfg.filesEnabled {
-				// Only forward the client IP when explicitly enabled (the
-				// backend trusts localhost for auth); otherwise withhold it so
-				// requests look local and don't trip an external-access warning.
-				xffIP := ""
-				if cfg.forwardClientIP {
-					xffIP = browserIP
-				}
-				httpProxy := streamtype.NewHTTPProxy(cfg.target, id.UID, cfg.server, xffIP, cfg.verbose)
-				// Pair a WebSocket handler so ws:// streams resolve to the same
-				// target as HTTP (otherwise: "no handler for stream type websocket").
-				handlers = append(handlers, httpProxy,
-					streamtype.NewWebSocket(httpProxy, xffIP, cfg.verbose))
-			} else {
-				localHTTP := streamtype.NewHTTPLocal(httpFront, cfg.verbose)
-				var proxyHTTP streamtype.StreamHandler
-				if cfg.proxyEnabled {
-					// Dynamic-target mode: withhold browser_ip so we DON'T inject
-					// XFF. This mode proxies arbitrary LAN apps that may rely on
-					// requests appearing local; silently forwarding the real IP
-					// could break their access control. (Fixed-target/OctoPrint
-					// mode above passes it — there the backend is known.)
-					p := streamtype.NewHTTPProxy("", id.UID, cfg.server, "", cfg.verbose)
-					proxyHTTP = p
-					handlers = append(handlers, streamtype.NewWebSocket(p, "", cfg.verbose))
-				}
-				handlers = append(handlers, newHTTPDispatcher(localHTTP, proxyHTTP))
-			}
+			p := newServePeer(clientID)
+			p.browserIP = browserIP
 
-			var sess *session.Session
-
-			conn, err := peer.HandleRequest(msg, signalingClient, id, func(data []byte) {
-				if sess != nil {
-					sess.HandleMessage(data)
-				}
-			}, cfg.verbose)
+			conn, err := peer.HandleRequest(msg, signalingClient, id, p.q.Enqueue, cfg.verbose)
 			if err != nil {
 				log.Printf("Failed to create peer connection: %v", err)
 				return
 			}
+			p.conn = conn
+			p.q.SetConn(conn)
 
-			sess = session.New(conn.DC, pinAuth, cfg.verbose, handlers...)
+			// Resolve the presented code against the table as it stands
+			// now. Set here, after HandleRequest and before the answer
+			// arrives, which is the only window there is: the code rides
+			// on the answer, so nothing before this point knows what the
+			// connector may reach.
+			conn.Authorize = func(code string) (protocol.Access, bool) {
+				terms, ok := currentTable().Authorize(code, time.Now())
+				if !ok {
+					return protocol.AccessDefault, false
+				}
+				p.grant(terms)
+				return protocol.AccessDefault, true
+			}
 
 			// Count this session against the unauth cap; release the slot
-			// exactly once, whichever comes first: it authenticates (OnReady)
-			// or it closes. sync.Once makes the double-path idempotent.
+			// exactly once, whichever comes first: it authenticates
+			// (OnReady) or it closes. sync.Once makes the double-path
+			// idempotent.
 			unauthSessions.Add(1)
 			var releaseOnce sync.Once
-			release := func() { releaseOnce.Do(func() { unauthSessions.Add(-1) }) }
+			p.release = func() { releaseOnce.Do(func() { unauthSessions.Add(-1) }) }
 
-			forget := func() {
-				mu.Lock()
-				if connections[clientID] == conn {
-					delete(connections, clientID)
-				}
-				mu.Unlock()
-			}
-
-			// Neither of the release paths above can be reached by a peer
-			// that requests a connection and then goes quiet: with no SDP
-			// answer the connection never leaves WebRTC's `new` state, so
-			// there is no data channel to close and no terminal state to
-			// observe. Without a deadline, maxUnauthSessions such peers
-			// wedge the listener for good.
-			deadline := newDeadlineGuard(unreadyPeerTimeout, func() {
+			// Neither release path can be reached by a peer that requests
+			// a connection and then goes quiet: with no SDP answer the
+			// connection never leaves WebRTC's `new` state, so there is no
+			// data channel to close and no terminal state to observe.
+			// Without a deadline, maxUnauthSessions such peers wedge the
+			// listener for good.
+			p.deadline = newDeadlineGuard(unreadyPeerTimeout, func() {
 				log.Printf("Dropping %s: handshake not completed within %s", clientID, unreadyPeerTimeout)
-				conn.Close()
+				p.close()
 			})
-			sess.OnReady = func() {
-				deadline.Done()
-				release()
-			}
 
-			// Per-connection teardown, run when the data channel closes.
-			var onClose []func()
-			onClose = append(onClose, deadline.Done, sess.Close, release, forget)
-			// Kill any shell processes — without this they outlive the
-			// browser tab and keep holding their max-sessions slot.
-			if shellHandler != nil {
-				onClose = append(onClose, shellHandler.Close)
-			}
-			if tcpHandler != nil {
-				onClose = append(onClose, tcpHandler.CloseAll)
-			}
-			// Tear down the video PC and unregister the bridge.
+			// The video bridge does not depend on scope, so it is built
+			// with the request and attached when the session appears.
 			if videoClient != nil {
 				// Forward the data PC's ICE servers so the video PC can use
 				// the same STUN/TURN (needed for peers with no direct path).
 				var iceServers []map[string]interface{}
 				if raw, ok := msg["ice_servers"].([]interface{}); ok {
-					for _, s := range raw {
-						if m, ok := s.(map[string]interface{}); ok {
+					for _, srv := range raw {
+						if m, ok := srv.(map[string]interface{}); ok {
 							iceServers = append(iceServers, m)
 						}
 					}
 				}
-				bridge := videoClient.Bridge(clientID, iceServers)
-				sess.SetVideoBridge(bridge)
-				onClose = append(onClose, bridge.Close)
+				p.bridge = videoClient.Bridge(clientID, iceServers)
 			}
+
 			mu.Lock()
-			connections[clientID] = conn
+			connections[clientID] = p
 			mu.Unlock()
 			conn.SetOnClose(func() {
-				for _, f := range onClose {
-					f()
-				}
+				p.close()
+				forget(clientID, p)
 			})
 
 		case "answer":
 			clientID, _ := msg["client_id"].(string)
 			sdp, _ := msg["sdp"].(string)
 			mu.Lock()
-			conn := connections[clientID]
+			p := connections[clientID]
 			mu.Unlock()
-			if conn == nil {
+			if p == nil {
 				return
 			}
 			// Pair-flow answers skip the bidirectional-verify decrypt —
 			// SAS comparison (run from the data-channel OnOpen) is the
 			// substitute, since the connector doesn't hold an access
 			// code yet to feed encrypted_request with.
-			if conn.PairingMode {
-				if err := conn.HandlePairAnswer(sdp); err != nil {
+			if p.conn.PairingMode {
+				if err := p.conn.HandlePairAnswer(sdp); err != nil {
 					log.Printf("Failed to handle pair answer: %v", err)
-					conn.Close()
+					p.close()
 				}
 				return
 			}
 			encrypted, _ := msg["encrypted_request"].(string)
-			if err := conn.HandleAnswer(sdp, encrypted); err != nil {
+			if err := p.conn.HandleAnswer(sdp, encrypted); err != nil {
 				log.Printf("Failed to handle answer: %v", err)
-				conn.Close()
+				p.close()
+				return
+			}
+
+			// Authorize ran inside HandleAnswer, so the terms are known.
+			// Build the handler set from what they grant, rather than
+			// building everything and checking later: sendReady derives
+			// advertised caps from the set, and OnConnect never runs for a
+			// handler that was never built.
+			label, terms := p.granted()
+			if label == "" {
+				log.Printf("Dropping %s: answer accepted with no terms resolved", clientID)
+				p.close()
+				return
+			}
+			granted := terms.GrantSet(offeredScopes(cfg))
+			h := buildHandlers(cfg, granted, share, shellArgv, id, p.browserIP)
+
+			sess := session.New(p.conn.DC, pinAuth, cfg.verbose, h.all...)
+			sess.OnReady = func() {
+				p.deadline.Done()
+				p.release()
+			}
+			if p.bridge != nil {
+				sess.SetVideoBridge(p.bridge)
+			}
+			if !p.admit(sess, h) {
+				// Teardown won the race; nothing published, so close the
+				// session we just built rather than leaking it.
+				sess.Close()
+				return
+			}
+			if label != links.MeLabel {
+				log.Printf("Peer %s authorized on link %q (%v)", clientID, label, terms.Grants(offeredScopes(cfg)))
 			}
 
 		case "pair_request":
@@ -660,54 +685,40 @@ func startListener(cfg serveConfig) {
 				log.Printf("Failed to handle pair request: %v", err)
 				return
 			}
+			// Pairing is unscoped: PairingMode skips the access-code check
+			// entirely, so no terms are ever resolved for this peer and the
+			// poll leaves it alone. It also never gets a session here --
+			// the handshake delivers a code the connector reconnects with.
+			p := newServePeer(clientID)
+			p.conn = conn
+			p.q.SetConn(conn)
 			mu.Lock()
-			connections[clientID] = conn
+			connections[clientID] = p
 			mu.Unlock()
-			deadline := newDeadlineGuard(unreadyPeerTimeout, func() {
+			p.deadline = newDeadlineGuard(unreadyPeerTimeout, func() {
 				log.Printf("Dropping pair %s: handshake not completed within %s", clientID, unreadyPeerTimeout)
-				conn.Close()
+				p.close()
 			})
 			conn.SetOnClose(func() {
-				deadline.Done()
-				mu.Lock()
-				if connections[clientID] == conn {
-					delete(connections, clientID)
-				}
-				mu.Unlock()
+				p.close()
+				forget(clientID, p)
 			})
 
 		case "candidate":
 			clientID, _ := msg["client_id"].(string)
 			candidateData, _ := msg["candidate"].(map[string]interface{})
 			mu.Lock()
-			conn := connections[clientID]
+			p := connections[clientID]
 			mu.Unlock()
-			if conn == nil {
+			if p == nil {
 				return
 			}
-			_ = conn.AddICECandidate(candidateData)
+			_ = p.conn.AddICECandidate(candidateData)
 
 		case "error":
 			log.Printf("Signaling error: %v", msg["message"])
 		}
 	})
-}
-
-// isAllMode reports whether the listener is running in `serve` (all-
-// caps) mode rather than a single-cap mode. Used to gate the launcher
-// hamburger: only the all-mode launcher tab gets a cap bar.
-func isAllMode(cfg serveConfig) bool {
-	n := 0
-	if cfg.shellEnabled {
-		n++
-	}
-	if cfg.filesEnabled {
-		n++
-	}
-	if cfg.proxyEnabled {
-		n++
-	}
-	return n > 1
 }
 
 // launcherCapBarItems composes the dropdown for the all-mode launcher

@@ -1,0 +1,221 @@
+package main
+
+import (
+	"sort"
+	"testing"
+	"time"
+
+	"github.com/richlegrand/bitbang/internal/fileshare"
+	"github.com/richlegrand/bitbang/internal/identity"
+	"github.com/richlegrand/bitbang/internal/links"
+)
+
+// Today a files-only listener cannot become a shell because it has no
+// shell handler. With links that is an enforcement check, and a bug in
+// it is privilege escalation -- so these gate the merge.
+
+func allCapsConfig(t *testing.T) (serveConfig, *fileshare.FileShare, *identity.Identity) {
+	t.Helper()
+	cfg := serveConfig{
+		shellEnabled: true, filesEnabled: true, proxyEnabled: true,
+		filesPath: t.TempDir(), shellMaxSessions: 2, server: defaultServer,
+	}
+	share, err := fileshare.New(cfg.filesPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := identity.Load("", true) // ephemeral: no files touched
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cfg, share, id
+}
+
+// capsFor builds the handler set a link with the given scope would get,
+// and reports the stream types it can reach. Types come from the same
+// place `ready` gets its caps, which is the point of building the set
+// rather than checking at stream-open time.
+func capsFor(t *testing.T, scope []string) []string {
+	t.Helper()
+	cfg, share, id := allCapsConfig(t)
+	terms := links.Terms{Label: "x", Scope: scope}
+	granted := terms.GrantSet(offeredScopes(cfg))
+	h := buildHandlers(cfg, granted, share, nil, id, "")
+
+	var caps []string
+	for _, handler := range h.all {
+		caps = append(caps, handler.Type())
+	}
+	sort.Strings(caps)
+	return caps
+}
+
+func TestScope_FilesCannotReachShellTCPOrProxy(t *testing.T) {
+	caps := capsFor(t, []string{links.ScopeFiles})
+	for _, forbidden := range []string{"shell", "tcp", "websocket"} {
+		for _, got := range caps {
+			if got == forbidden {
+				t.Errorf("a files-scoped link reached %q; caps=%v", forbidden, caps)
+			}
+		}
+	}
+	if !contains(caps, "file") {
+		t.Errorf("a files-scoped link cannot reach files; caps=%v", caps)
+	}
+	// http is present because the browser UI rides on every link, but it
+	// must be the local branch with no proxy behind it.
+	assertNoProxyBranch(t, []string{links.ScopeFiles})
+}
+
+func TestScope_ProxyGetsBothHTTPAndWebSocket(t *testing.T) {
+	caps := capsFor(t, []string{links.ScopeProxy})
+	if !contains(caps, "http") || !contains(caps, "websocket") {
+		t.Errorf("proxy must never be half of itself; caps=%v", caps)
+	}
+}
+
+func TestScope_ShellAndForwardAreSeparable(t *testing.T) {
+	shellOnly := capsFor(t, []string{links.ScopeShell})
+	if !contains(shellOnly, "shell") || contains(shellOnly, "tcp") {
+		t.Errorf("shell-scoped link caps=%v, want shell without tcp", shellOnly)
+	}
+	forwardOnly := capsFor(t, []string{links.ScopeForward})
+	if !contains(forwardOnly, "tcp") || contains(forwardOnly, "shell") {
+		t.Errorf("forward-scoped link caps=%v, want tcp without shell", forwardOnly)
+	}
+}
+
+func TestScope_AbsentScopeIsUnchangedBehavior(t *testing.T) {
+	caps := capsFor(t, nil)
+	for _, want := range []string{"file", "shell", "tcp", "http", "websocket"} {
+		if !contains(caps, want) {
+			t.Errorf("an unscoped link lost %q; caps=%v", want, caps)
+		}
+	}
+}
+
+func TestScope_NotServedIsDroppedNotGranted(t *testing.T) {
+	// A files-only listener with a shell-scoped link must conjure nothing.
+	cfg := serveConfig{filesEnabled: true, filesPath: t.TempDir(), server: defaultServer}
+	share, err := fileshare.New(cfg.filesPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := identity.Load("", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	terms := links.Terms{Label: "s", Scope: []string{links.ScopeShell}}
+	h := buildHandlers(cfg, terms.GrantSet(offeredScopes(cfg)), share, nil, id, "")
+	for _, handler := range h.all {
+		if handler.Type() == "shell" {
+			t.Fatal("a shell-scoped link conjured a shell on a files-only listener")
+		}
+	}
+	if h.shell != nil {
+		t.Fatal("shell handler built despite not being served")
+	}
+}
+
+// assertNoProxyBranch checks that the dispatcher for this scope has no
+// proxy behind it, so a path that looks like a LAN target resolves to
+// the local UI rather than reaching 192.168.x.x.
+func assertNoProxyBranch(t *testing.T, scope []string) {
+	t.Helper()
+	cfg, share, id := allCapsConfig(t)
+	terms := links.Terms{Label: "x", Scope: scope}
+	h := buildHandlers(cfg, terms.GrantSet(offeredScopes(cfg)), share, nil, id, "")
+	for _, handler := range h.all {
+		d, ok := handler.(*httpDispatcher)
+		if !ok {
+			continue
+		}
+		if d.proxy != nil {
+			t.Errorf("scope %v left the dispatcher's proxy branch wired; a LAN host is reachable", scope)
+		}
+		return
+	}
+	t.Errorf("scope %v produced no http dispatcher, so the browser UI is unreachable", scope)
+}
+
+// -- The poll: revocation reaches live sessions --
+
+func tableWith(t *testing.T, entries []links.Terms) *links.Table {
+	t.Helper()
+	offered := []string{links.ScopeFiles, links.ScopeShell, links.ScopeForward, links.ScopeProxy}
+	table, _, err := links.Build(entries, offered, "IDENTITY")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return table
+}
+
+// peerOn returns a peer that has already been granted the given terms,
+// with a queue that records whether it was closed.
+func peerOn(terms links.Terms) *servePeer {
+	p := newServePeer("client-1")
+	p.grant(terms)
+	return p
+}
+
+func TestPoll_DeletedLinkClosesLiveSession(t *testing.T) {
+	p := peerOn(links.Terms{Label: "contractor", Code: "C"})
+	pollPeers([]*servePeer{p}, tableWith(t, nil), time.Now())
+	if !p.q.IsClosed() {
+		t.Error("deleting a link left its session running; revocation only blocked reconnects")
+	}
+}
+
+func TestPoll_ExpiredLinkClosesLiveSession(t *testing.T) {
+	past := time.Now().Add(-time.Hour)
+	terms := links.Terms{Label: "contractor", Code: "C", Expires: &past}
+	p := peerOn(terms)
+	pollPeers([]*servePeer{p}, tableWith(t, []links.Terms{terms}), time.Now())
+	if !p.q.IsClosed() {
+		t.Error("an expired link's session stayed open with no file change to trigger the check")
+	}
+}
+
+func TestPoll_NarrowedScopeClosesLiveSession(t *testing.T) {
+	wide := links.Terms{Label: "contractor", Code: "C"}
+	narrow := links.Terms{Label: "contractor", Code: "C", Scope: []string{links.ScopeFiles}}
+	p := peerOn(wide)
+	pollPeers([]*servePeer{p}, tableWith(t, []links.Terms{narrow}), time.Now())
+	if !p.q.IsClosed() {
+		t.Error("a narrowed link kept its old handler set; the set cannot shrink in place")
+	}
+}
+
+func TestPoll_UnchangedLinkIsLeftAlone(t *testing.T) {
+	terms := links.Terms{Label: "contractor", Code: "C", Scope: []string{links.ScopeFiles}}
+	p := peerOn(terms)
+	pollPeers([]*servePeer{p}, tableWith(t, []links.Terms{terms}), time.Now())
+	if p.q.IsClosed() {
+		t.Error("the poll closed a session whose link had not changed")
+	}
+}
+
+func TestPoll_MeSurvives(t *testing.T) {
+	p := peerOn(links.Terms{Label: links.MeLabel, Code: "IDENTITY"})
+	pollPeers([]*servePeer{p}, tableWith(t, nil), time.Now())
+	if p.q.IsClosed() {
+		t.Error("the poll closed the operator's own session; me must be a real row")
+	}
+}
+
+func TestPoll_HandshakingPeerIsLeftAlone(t *testing.T) {
+	p := newServePeer("client-2") // nothing granted yet
+	pollPeers([]*servePeer{p}, tableWith(t, nil), time.Now())
+	if p.q.IsClosed() {
+		t.Error("the poll closed a peer that had not presented a code yet")
+	}
+}
+
+func contains(haystack []string, needle string) bool {
+	for _, s := range haystack {
+		if s == needle {
+			return true
+		}
+	}
+	return false
+}
