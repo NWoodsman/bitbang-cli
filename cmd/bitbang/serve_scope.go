@@ -1,31 +1,26 @@
 package main
 
 import (
-	"os"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
 
 	"github.com/richlegrand/bitbang/internal/fileshare"
 	"github.com/richlegrand/bitbang/internal/identity"
 	"github.com/richlegrand/bitbang/internal/links"
+	"github.com/richlegrand/bitbang/internal/shellweb"
 	"github.com/richlegrand/bitbang/internal/streamtype"
 )
 
-// offeredScopes lists the scope names this listener supports, which is
-// what an absent scope on a link resolves to and what a requested one is
-// intersected with.
-//
-// forward rides with shell: the TCP handler is only built in shell-
-// bearing modes, so `serve shell` can mint a forward-only link but
-// `serve files` cannot.
+// offeredScopes lists what this listener supports, which is what an absent
+// scope on a link resolves to and what a requested one is intersected with.
 func offeredScopes(cfg serveConfig) []string {
 	var out []string
-	if cfg.filesEnabled {
-		out = append(out, links.ScopeFiles)
-	}
-	if cfg.shellEnabled {
-		out = append(out, links.ScopeShell, links.ScopeForward)
-	}
-	if cfg.proxyEnabled {
-		out = append(out, links.ScopeProxy)
+	for _, c := range capabilities {
+		if cfg.caps.has(c.Scope) {
+			out = append(out, c.Scope)
+		}
 	}
 	return out
 }
@@ -45,110 +40,147 @@ type sessionHandlers struct {
 // Building the set rather than filtering a complete one is what makes
 // scope enforcement free: sendReady derives advertised caps from the
 // registered handlers, so a files-scoped link advertises caps ["file"]
-// with no extra code; `bitbang connect` already fails with a legible
-// "listener does not advertise the 'shell' capability"; and OnConnect
-// never runs for a handler that was never built, which matters because
-// the HTTP proxy's OnConnect resolves and probes its target.
-//
-// The listener's own browser UI is the one thing no scope gates. It is
-// the shell the other scopes act through -- a files-only link still has
-// to render a file browser -- so it is built for every link, showing
-// only the caps that link actually grants.
+// with no extra code; `bitbang connect` already fails with "listener does
+// not advertise the 'shell' capability"; and OnConnect never runs for a
+// handler that was never built, which matters because the HTTP proxy's
+// OnConnect resolves and probes its target.
 func buildHandlers(cfg serveConfig, granted map[string]bool, share *fileshare.FileShare,
 	shellArgv []string, id *identity.Identity, browserIP string) sessionHandlers {
 
+	x := capContext{cfg: cfg, share: share, shellArgv: shellArgv, id: id,
+		browserIP: browserIP, granted: granted}
+
 	var out sessionHandlers
-
-	if share != nil && granted[links.ScopeFiles] {
-		out.all = append(out.all, streamtype.NewFile(share, cfg.verbose))
-	}
-	if cfg.shellEnabled && granted[links.ScopeShell] {
-		sh := streamtype.NewShell(shellArgv, cfg.verbose)
-		sh.MaxConcurrent = cfg.shellMaxSessions
-		if cfg.shellMirror {
-			sh.StdoutMirror = os.Stdout
-			sh.StderrMirror = os.Stderr
+	for _, c := range capabilities {
+		if !x.reaches(c.Scope) {
+			continue
 		}
-		out.shell = sh
-		out.all = append(out.all, sh)
-	}
-	if cfg.shellEnabled && granted[links.ScopeForward] {
-		out.tcp = streamtype.NewTCP(cfg.verbose)
-		out.all = append(out.all, out.tcp)
-	}
-
-	// Fixed-target proxy-only mode (e.g. the OctoPrint plugin): every
-	// request goes straight to --target, so the plain device URL serves
-	// the app directly -- no dispatcher, no landing page. Here `http` IS
-	// the proxy, so the proxy scope gates it outright.
-	if cfg.proxyEnabled && cfg.target != "" && !cfg.shellEnabled && !cfg.filesEnabled {
-		if granted[links.ScopeProxy] {
-			// Only forward the client IP when explicitly enabled (the
-			// backend trusts localhost for auth); otherwise withhold it so
-			// requests look local and don't trip an external-access warning.
-			xffIP := ""
-			if cfg.forwardClientIP {
-				xffIP = browserIP
+		for _, h := range c.Build(x) {
+			// Two handlers own resources that outlive a stream, so the
+			// connection's teardown needs them by name.
+			switch t := h.(type) {
+			case *streamtype.ShellHandler:
+				out.shell = t
+			case *streamtype.TCPHandler:
+				out.tcp = t
 			}
-			httpProxy := streamtype.NewHTTPProxy(cfg.target, id.UID, cfg.server, xffIP, cfg.verbose)
-			// Pair a WebSocket handler so ws:// streams resolve to the same
-			// target as HTTP (otherwise: "no handler for stream type websocket").
-			out.all = append(out.all, httpProxy,
-				streamtype.NewWebSocket(httpProxy, xffIP, cfg.verbose))
+			out.all = append(out.all, h)
 		}
+	}
+
+	// With a fixed target `http` is the proxy itself, already contributed
+	// above, and there is no local UI to dispatch to.
+	if fixedTargetMode(cfg) {
 		return out
 	}
 
-	// Dispatcher mode. The local branch renders the UI for whatever this
-	// link grants; the proxy branch is handed over only when the link
-	// grants proxy, and a nil proxy is already how the dispatcher is told
-	// there is none.
-	front := buildServeHTTPHandler(
-		scopedShare(share, granted),
-		cfg.shellEnabled && granted[links.ScopeShell],
-		cfg.proxyEnabled && granted[links.ScopeProxy],
-		cfg.shellMaxSessions,
-		grantedCapCount(cfg, granted) > 1,
-	)
-	localHTTP := streamtype.NewHTTPLocal(front, cfg.verbose)
-
+	// The dispatcher is not a capability: the listener's browser UI is the
+	// frame the capabilities render in, so it rides on every link and shows
+	// only what that link grants. Its proxy branch is handed over only when
+	// the link reaches proxy, and a nil proxy is already how the dispatcher
+	// is told there is none.
 	var proxyHTTP streamtype.StreamHandler
-	if cfg.proxyEnabled && granted[links.ScopeProxy] {
-		// Dynamic-target mode: withhold browser_ip so we DON'T inject
-		// XFF. This mode proxies arbitrary LAN apps that may rely on
-		// requests appearing local; silently forwarding the real IP
-		// could break their access control. (Fixed-target mode above
-		// passes it -- there the backend is known.)
-		p := streamtype.NewHTTPProxy("", id.UID, cfg.server, "", cfg.verbose)
-		proxyHTTP = p
-		out.all = append(out.all, streamtype.NewWebSocket(p, "", cfg.verbose))
+	if x.reaches(links.ScopeProxy) {
+		proxyHTTP = dynamicProxy(x)
 	}
-	out.all = append(out.all, newHTTPDispatcher(localHTTP, proxyHTTP))
+	local := streamtype.NewHTTPLocal(buildServeHTTPHandler(x), cfg.verbose)
+	out.all = append(out.all, newHTTPDispatcher(local, proxyHTTP))
 	return out
 }
 
-// scopedShare hides the file share from a link that was not granted
-// files, so its browser UI has no file browser to offer.
-func scopedShare(share *fileshare.FileShare, granted map[string]bool) *fileshare.FileShare {
-	if granted[links.ScopeFiles] {
-		return share
+// buildServeHTTPHandler composes the in-process HTTP front-end from the
+// capabilities this link reaches.
+//
+// One granted cap is served at "/" directly, so relative URLs in its HTML
+// resolve cleanly. More than one gets the launcher: shell at "/" with the
+// cap bar injected, and each cap at its own mount.
+//
+// Dynamic-target reverse proxying lives at the SWSP layer in
+// streamtype.HTTPHandler, dispatched by httpDispatcher based on the connect
+// path -- those paths never reach this handler.
+func buildServeHTTPHandler(x capContext) http.Handler {
+	type mounted struct {
+		cap     capability
+		handler http.Handler
 	}
-	return nil
+	var live []mounted
+	for _, c := range capabilities {
+		if c.Web == nil || !x.reaches(c.Scope) {
+			continue
+		}
+		if h := c.Web(x); h != nil {
+			live = append(live, mounted{c, h})
+		}
+	}
+
+	if len(live) == 0 {
+		return http.HandlerFunc(http.NotFound)
+	}
+	if len(live) == 1 {
+		return live[0].handler
+	}
+
+	// The strip's dropdown anchors postMessage parent to open new tabs
+	// (bootstrap.js handles the URL composition).
+	launcher := shellweb.New(shellweb.WithCapBar(capBarItems(x))).HTTPHandler()
+
+	mux := http.NewServeMux()
+	capRoots := map[string]bool{}
+	for _, m := range live {
+		root := strings.TrimSuffix(m.cap.Mount, "/")
+		mux.Handle(m.cap.Mount, http.StripPrefix(root, m.handler))
+		capRoots[root] = true
+	}
+
+	// "/" is the launcher tab: shell plus the strip. Without shell, the
+	// first granted cap takes the root instead.
+	if x.reaches(links.ScopeShell) {
+		mux.Handle("/", launcher)
+	} else {
+		mux.Handle("/", live[0].handler)
+	}
+
+	// Trailing-slash normalizer for the cap subpath roots. Without this,
+	// "/proxy" -> 301 -> "/proxy/", and the redirect's server-relative
+	// Location loses the browser's /__device__/<sessionId>/ prefix.
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if capRoots[r.URL.Path] {
+			r.URL.Path += "/"
+		}
+		mux.ServeHTTP(w, r)
+	})
 }
 
-// grantedCapCount counts the browser-visible caps this link reaches.
-// One means the UI can serve that cap directly, so relative URLs in its
-// HTML resolve cleanly; more than one needs the launcher and its cap bar.
-func grantedCapCount(cfg serveConfig, granted map[string]bool) int {
-	n := 0
-	if cfg.filesEnabled && granted[links.ScopeFiles] {
-		n++
+// capBarItems composes the launcher dropdown from the capabilities this
+// link reaches. Items render in table order.
+func capBarItems(x capContext) []shellweb.CapBarItem {
+	var items []shellweb.CapBarItem
+	for _, c := range capabilities {
+		if c.Menu == "" || !x.reaches(c.Scope) {
+			continue
+		}
+		if c.MenuWhen != nil && !c.MenuWhen(x) {
+			continue
+		}
+		items = append(items, shellweb.CapBarItem{Label: c.Menu, Path: c.MenuPath})
 	}
-	if cfg.shellEnabled && granted[links.ScopeShell] {
-		n++
+	return items
+}
+
+// printSharingBlock prints the "Sharing:" status block listing each
+// offered capability with its salient configuration.
+//
+// Takes a writer so the exact wording can be pinned by a test: this block
+// is the listener's answer to "what did I just expose", and a slip in it
+// is user-visible with nothing else to catch it.
+func printSharingBlock(w io.Writer, cfg serveConfig, share *fileshare.FileShare) {
+	x := capContext{cfg: cfg, share: share}
+	fmt.Fprintln(w, "Sharing:")
+	for _, c := range capabilities {
+		if c.Describe == nil || !cfg.caps.has(c.Scope) {
+			continue
+		}
+		c.Describe(w, x)
 	}
-	if cfg.proxyEnabled && granted[links.ScopeProxy] {
-		n++
-	}
-	return n
+	fmt.Fprintln(w)
 }

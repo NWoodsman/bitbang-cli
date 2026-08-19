@@ -1,0 +1,239 @@
+package main
+
+import (
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+
+	"github.com/richlegrand/bitbang/internal/fileshare"
+	"github.com/richlegrand/bitbang/internal/identity"
+	"github.com/richlegrand/bitbang/internal/links"
+	"github.com/richlegrand/bitbang/internal/proxyweb"
+	"github.com/richlegrand/bitbang/internal/shellweb"
+	"github.com/richlegrand/bitbang/internal/streamtype"
+)
+
+// capSet is what a listener offers, named in the scope vocabulary.
+type capSet map[string]bool
+
+func capsOf(names ...string) capSet {
+	s := make(capSet, len(names))
+	for _, n := range names {
+		s[n] = true
+	}
+	return s
+}
+
+func (c capSet) has(name string) bool { return c[name] }
+
+// capContext is everything a capability needs to make itself real for one
+// peer: the config it was started with, and the per-connection facts.
+type capContext struct {
+	cfg       serveConfig
+	share     *fileshare.FileShare
+	shellArgv []string
+	id        *identity.Identity
+	browserIP string
+	// granted is what this peer's link allows, which is what decides
+	// whether a capability contributes at all.
+	granted map[string]bool
+}
+
+func (x capContext) offers(scope string) bool  { return x.cfg.caps.has(scope) }
+func (x capContext) reaches(scope string) bool { return x.offers(scope) && x.granted[scope] }
+
+// A capability is one thing a link can grant. Scope is the permanent part
+// -- those names live in config files people keep -- and the rest is how
+// this listener implements it today.
+//
+// Before this table the same set was spelled out six times: config
+// booleans, handler Type() strings, scope names, mux mounts, cap-bar
+// items, and the Sharing block. They did not agree on cardinality, and
+// adding per-link scope meant hand-writing the mapping between all of
+// them. Everything now derives from one list.
+//
+// Two things are deliberately not capabilities. The listener's own browser
+// UI is the frame the others render in, not something a link is scoped to,
+// so it rides on every link and shows only what that link grants. And
+// websocket is not its own entry: it belongs to proxy's Build, which is
+// what stops anyone granting http without it and producing a proxy that
+// half works.
+type capability struct {
+	Scope string
+
+	// Build contributes this capability's stream handlers, or nothing when
+	// the link does not reach it.
+	Build func(capContext) []streamtype.StreamHandler
+
+	// Mount is where this capability's UI hangs in the all-mode mux, empty
+	// for a capability with no browser side. Web builds that UI.
+	Mount string
+	Web   func(capContext) http.Handler
+
+	// Menu is the cap-bar label, empty for no entry, and MenuPath is where
+	// it points -- shell's is "/" because the launcher tab is the shell.
+	// MenuWhen, when set, suppresses the entry in configurations where it
+	// would be useless.
+	Menu     string
+	MenuPath string
+	MenuWhen func(capContext) bool
+
+	// Describe writes this capability's line (or lines) in the Sharing
+	// block, given a listener that offers it.
+	Describe func(io.Writer, capContext)
+}
+
+// capabilities is the whole vocabulary, in the order things are presented.
+var capabilities = []capability{
+	{
+		Scope: links.ScopeShell,
+		Build: func(x capContext) []streamtype.StreamHandler {
+			sh := streamtype.NewShell(x.shellArgv, x.cfg.verbose)
+			sh.MaxConcurrent = x.cfg.shellMaxSessions
+			if x.cfg.shellMirror {
+				sh.StdoutMirror = os.Stdout
+				sh.StderrMirror = os.Stderr
+			}
+			return []streamtype.StreamHandler{sh}
+		},
+		Mount:    "/shell/",
+		Web:      func(capContext) http.Handler { return shellweb.New().HTTPHandler() },
+		Menu:     "Shell",
+		MenuPath: "/",
+		// With one session allowed, the launcher tab IS the only shell and
+		// offering another would just hit the limit.
+		MenuWhen: func(x capContext) bool { return x.cfg.shellMaxSessions != 1 },
+		Describe: describeShell,
+	},
+	{
+		Scope: links.ScopeForward,
+		Build: func(x capContext) []streamtype.StreamHandler {
+			return []streamtype.StreamHandler{streamtype.NewTCP(x.cfg.verbose)}
+		},
+		// No Mount and no Menu: forwarding is driven by `connect -L`, and
+		// there is nothing for a browser to show.
+		Describe: describeForward,
+	},
+	{
+		Scope: links.ScopeFiles,
+		Build: func(x capContext) []streamtype.StreamHandler {
+			if x.share == nil {
+				return nil
+			}
+			return []streamtype.StreamHandler{streamtype.NewFile(x.share, x.cfg.verbose)}
+		},
+		Mount: "/files/",
+		Web: func(x capContext) http.Handler {
+			if x.share == nil {
+				return nil
+			}
+			return x.share.HTTPHandler()
+		},
+		Menu:     "Files",
+		MenuPath: "/files/",
+		MenuWhen: func(x capContext) bool { return x.share != nil },
+		Describe: describeFiles,
+	},
+	{
+		Scope:    links.ScopeProxy,
+		Build:    buildProxyHandlers,
+		Mount:    "/proxy/",
+		Web:      func(capContext) http.Handler { return proxyweb.LandingHandler() },
+		Menu:     "Proxy",
+		MenuPath: "/proxy/",
+		Describe: describeProxy,
+	},
+}
+
+// buildProxyHandlers is the one Build that branches, because proxy means
+// two different things depending on how the listener was started.
+//
+// With a fixed target there is no dispatcher and no local UI: `http` IS
+// the proxy, so this returns it directly along with the websocket handler
+// that has to resolve to the same target. In dispatcher mode it returns
+// only websocket; the http half is the dispatcher's proxy branch, wired by
+// buildHandlers because the dispatcher is not a capability.
+func buildProxyHandlers(x capContext) []streamtype.StreamHandler {
+	if !fixedTargetMode(x.cfg) {
+		p := dynamicProxy(x)
+		return []streamtype.StreamHandler{streamtype.NewWebSocket(p, "", x.cfg.verbose)}
+	}
+	// Only forward the client IP when explicitly enabled (the backend
+	// trusts localhost for auth); otherwise withhold it so requests look
+	// local and don't trip an external-access warning.
+	xffIP := ""
+	if x.cfg.forwardClientIP {
+		xffIP = x.browserIP
+	}
+	p := streamtype.NewHTTPProxy(x.cfg.target, x.id.UID, x.cfg.server, xffIP, x.cfg.verbose)
+	return []streamtype.StreamHandler{p, streamtype.NewWebSocket(p, xffIP, x.cfg.verbose)}
+}
+
+// dynamicProxy builds the dynamic-target proxy. It withholds browser_ip so
+// we DON'T inject XFF: this mode proxies arbitrary LAN apps that may rely
+// on requests appearing local, and silently forwarding the real IP could
+// break their access control. Fixed-target mode passes it -- there the
+// backend is known.
+func dynamicProxy(x capContext) *streamtype.HTTPHandler {
+	return streamtype.NewHTTPProxy("", x.id.UID, x.cfg.server, "", x.cfg.verbose)
+}
+
+// fixedTargetMode reports the proxy-only-with-a-target configuration (e.g.
+// the OctoPrint plugin): every request goes straight to --target, so the
+// plain device URL serves the app directly, with no dispatcher and no
+// landing page.
+func fixedTargetMode(cfg serveConfig) bool {
+	return cfg.caps.has(links.ScopeProxy) && cfg.target != "" &&
+		!cfg.caps.has(links.ScopeShell) && !cfg.caps.has(links.ScopeFiles)
+}
+
+// -- Sharing block descriptions --
+
+func describeShell(w io.Writer, x capContext) {
+	line := "  • shell  ("
+	if x.cfg.shellCmd != "" {
+		line += x.cfg.shellCmd
+	} else {
+		line += defaultShellLabel()
+	}
+	if x.cfg.shellMaxSessions == 0 {
+		line += ", unlimited concurrent sessions"
+	} else if x.cfg.shellMaxSessions != 1 {
+		line += fmt.Sprintf(", max %d concurrent sessions", x.cfg.shellMaxSessions)
+	}
+	if x.cfg.shellMirror {
+		line += ", mirroring to console"
+	}
+	line += ")"
+	fmt.Fprintln(w, line)
+}
+
+func describeForward(w io.Writer, _ capContext) {
+	fmt.Fprintf(w, "  • tcp    (unrestricted targets chosen by connect -L; max %d concurrent connections per session; loopback-bound on connector by default)\n",
+		streamtype.DefaultTCPMaxConcurrent)
+}
+
+func describeFiles(w io.Writer, x capContext) {
+	if x.share == nil {
+		return
+	}
+	if x.share.Mode == fileshare.ModeSend {
+		fmt.Fprintf(w, "  • files  (%s — single file)\n", x.share.FileName)
+		return
+	}
+	line := fmt.Sprintf("  • files  (%s", x.share.BasePath)
+	if x.share.UploadEnabled {
+		line += ", uploads enabled"
+	}
+	line += ")"
+	fmt.Fprintln(w, line)
+}
+
+func describeProxy(w io.Writer, x capContext) {
+	if x.cfg.target != "" {
+		fmt.Fprintf(w, "  • proxy  (%s)\n", x.cfg.target)
+		return
+	}
+	fmt.Fprintln(w, "  • proxy  (target chosen in browser)")
+}

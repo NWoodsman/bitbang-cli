@@ -16,10 +16,7 @@ import (
 
 func allCapsConfig(t *testing.T) (serveConfig, *fileshare.FileShare, *identity.Identity) {
 	t.Helper()
-	cfg := serveConfig{
-		shellEnabled: true, filesEnabled: true, proxyEnabled: true,
-		filesPath: t.TempDir(), shellMaxSessions: 2, server: defaultServer,
-	}
+	cfg := serveConfig{caps: capsOf(links.ScopeShell, links.ScopeForward, links.ScopeFiles, links.ScopeProxy), filesPath: t.TempDir(), shellMaxSessions: 2, server: defaultServer}
 	share, err := fileshare.New(cfg.filesPath)
 	if err != nil {
 		t.Fatal(err)
@@ -96,7 +93,7 @@ func TestScope_AbsentScopeIsUnchangedBehavior(t *testing.T) {
 
 func TestScope_NotServedIsDroppedNotGranted(t *testing.T) {
 	// A files-only listener with a shell-scoped link must conjure nothing.
-	cfg := serveConfig{filesEnabled: true, filesPath: t.TempDir(), server: defaultServer}
+	cfg := serveConfig{caps: capsOf(links.ScopeFiles), filesPath: t.TempDir(), server: defaultServer}
 	share, err := fileshare.New(cfg.filesPath)
 	if err != nil {
 		t.Fatal(err)

@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/richlegrand/bitbang/internal/fileshare"
+	"github.com/richlegrand/bitbang/internal/links"
 )
 
 // The Sharing block is the listener's answer to "what did I just expose",
@@ -42,7 +43,7 @@ func TestSharingBlock(t *testing.T) {
 	}{
 		{
 			name: "shell only, defaults",
-			cfg:  serveConfig{shellEnabled: true, shellMaxSessions: 1},
+			cfg:  serveConfig{caps: capsOf(links.ScopeShell, links.ScopeForward), shellMaxSessions: 1},
 			want: []string{
 				"Sharing:",
 				"  • shell  (" + defaultShellLabel() + ")",
@@ -52,10 +53,8 @@ func TestSharingBlock(t *testing.T) {
 		},
 		{
 			name: "shell with a command, session cap, and mirroring",
-			cfg: serveConfig{
-				shellEnabled: true, shellCmd: "/bin/zsh",
-				shellMaxSessions: 3, shellMirror: true,
-			},
+			cfg: serveConfig{caps: capsOf(links.ScopeShell, links.ScopeForward), shellCmd: "/bin/zsh",
+				shellMaxSessions: 3, shellMirror: true},
 			want: []string{
 				"Sharing:",
 				"  • shell  (/bin/zsh, max 3 concurrent sessions, mirroring to console)",
@@ -65,7 +64,7 @@ func TestSharingBlock(t *testing.T) {
 		},
 		{
 			name: "unlimited shell sessions",
-			cfg:  serveConfig{shellEnabled: true, shellMaxSessions: 0},
+			cfg:  serveConfig{caps: capsOf(links.ScopeShell, links.ScopeForward), shellMaxSessions: 0},
 			want: []string{
 				"Sharing:",
 				"  • shell  (" + defaultShellLabel() + ", unlimited concurrent sessions)",
@@ -75,38 +74,35 @@ func TestSharingBlock(t *testing.T) {
 		},
 		{
 			name:  "files, a directory",
-			cfg:   serveConfig{filesEnabled: true},
+			cfg:   serveConfig{caps: capsOf(links.ScopeFiles)},
 			share: shareDir,
 			want:  []string{"Sharing:", "  • files  (" + dir + ")", ""},
 		},
 		{
 			name:  "files, a directory with uploads",
-			cfg:   serveConfig{filesEnabled: true},
+			cfg:   serveConfig{caps: capsOf(links.ScopeFiles)},
 			share: uploads,
 			want:  []string{"Sharing:", "  • files  (" + dir + ", uploads enabled)", ""},
 		},
 		{
 			name:  "files, a single file",
-			cfg:   serveConfig{filesEnabled: true},
+			cfg:   serveConfig{caps: capsOf(links.ScopeFiles)},
 			share: shareFile,
 			want:  []string{"Sharing:", "  • files  (one.bin — single file)", ""},
 		},
 		{
 			name: "proxy, target chosen in the browser",
-			cfg:  serveConfig{proxyEnabled: true},
+			cfg:  serveConfig{caps: capsOf(links.ScopeProxy)},
 			want: []string{"Sharing:", "  • proxy  (target chosen in browser)", ""},
 		},
 		{
 			name: "proxy, fixed target",
-			cfg:  serveConfig{proxyEnabled: true, target: "localhost:5000"},
+			cfg:  serveConfig{caps: capsOf(links.ScopeProxy), target: "localhost:5000"},
 			want: []string{"Sharing:", "  • proxy  (localhost:5000)", ""},
 		},
 		{
-			name: "all caps, in order",
-			cfg: serveConfig{
-				shellEnabled: true, filesEnabled: true, proxyEnabled: true,
-				shellMaxSessions: 1,
-			},
+			name:  "all caps, in order",
+			cfg:   serveConfig{caps: capsOf(links.ScopeShell, links.ScopeForward, links.ScopeFiles, links.ScopeProxy), shellMaxSessions: 1},
 			share: shareDir,
 			want: []string{
 				"Sharing:",
@@ -119,7 +115,7 @@ func TestSharingBlock(t *testing.T) {
 		},
 		{
 			name: "files enabled but no share is silent",
-			cfg:  serveConfig{filesEnabled: true},
+			cfg:  serveConfig{caps: capsOf(links.ScopeFiles)},
 			want: []string{"Sharing:", ""},
 		},
 	}

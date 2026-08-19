@@ -6,6 +6,8 @@ import (
 	"errors"
 	"path/filepath"
 	"strings"
+
+	"github.com/richlegrand/bitbang/internal/links"
 )
 
 // errIdentityBusy is returned by acquireIdentityLock when another local process
@@ -34,14 +36,14 @@ func deriveProgram(cfg serveConfig) string {
 		return cfg.program
 	}
 	switch {
-	case cfg.shellEnabled:
+	case cfg.caps.has(links.ScopeShell):
 		return "bitbang"
-	case cfg.proxyEnabled:
+	case cfg.caps.has(links.ScopeProxy):
 		if cfg.target != "" {
 			return "proxy-" + slug(normalizeTarget(cfg.target))
 		}
 		return "proxy"
-	case cfg.filesEnabled:
+	case cfg.caps.has(links.ScopeFiles):
 		if cfg.filesPath != "" {
 			return "files-" + slug(normalizePath(cfg.filesPath))
 		}

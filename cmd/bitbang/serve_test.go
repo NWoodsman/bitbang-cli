@@ -7,7 +7,22 @@ import (
 	"testing"
 
 	"github.com/richlegrand/bitbang/internal/fileshare"
+	"github.com/richlegrand/bitbang/internal/links"
 )
+
+// testCtx builds the context the capability table works from: a listener
+// offering these caps, with a link that reaches all of them.
+func testCtx(share *fileshare.FileShare, maxSessions int, caps ...string) capContext {
+	granted := make(map[string]bool, len(caps))
+	for _, c := range caps {
+		granted[c] = true
+	}
+	return capContext{
+		cfg:     serveConfig{caps: capsOf(caps...), shellMaxSessions: maxSessions},
+		share:   share,
+		granted: granted,
+	}
+}
 
 // TestBuildServeHTTPHandler_AllModeRouting exercises the all-mode mux:
 // shell-with-cap-bar at /, plain shell at /shell/, files at /files/,
@@ -17,7 +32,7 @@ func TestBuildServeHTTPHandler_AllModeRouting(t *testing.T) {
 	if err != nil {
 		t.Fatalf("fileshare.New: %v", err)
 	}
-	h := buildServeHTTPHandler(share, true, true, 1, true)
+	h := buildServeHTTPHandler(testCtx(share, 1, links.ScopeShell, links.ScopeForward, links.ScopeFiles, links.ScopeProxy))
 
 	cases := []struct {
 		path            string
@@ -59,10 +74,10 @@ func TestBuildServeHTTPHandler_ShellRootCapBarOnlyAtSlash(t *testing.T) {
 	if err != nil {
 		t.Fatalf("fileshare.New: %v", err)
 	}
-	h := buildServeHTTPHandler(share, true, true, 1, true)
+	h := buildServeHTTPHandler(testCtx(share, 1, links.ScopeShell, links.ScopeForward, links.ScopeFiles, links.ScopeProxy))
 
 	for _, tc := range []struct {
-		path     string
+		path      string
 		wantStrip bool
 	}{
 		{path: "/", wantStrip: true},
@@ -86,7 +101,7 @@ func TestBuildServeHTTPHandler_CapRootsNoRedirect(t *testing.T) {
 	if err != nil {
 		t.Fatalf("fileshare.New: %v", err)
 	}
-	h := buildServeHTTPHandler(share, true, true, 1, true)
+	h := buildServeHTTPHandler(testCtx(share, 1, links.ScopeShell, links.ScopeForward, links.ScopeFiles, links.ScopeProxy))
 
 	for _, p := range []string{"/proxy", "/shell", "/files"} {
 		req := httptest.NewRequest("GET", p, nil)
@@ -102,7 +117,7 @@ func TestBuildServeHTTPHandler_CapRootsNoRedirect(t *testing.T) {
 // TestBuildServeHTTPHandler_SingleCapFastPath verifies single-cap modes
 // skip the mux entirely so relative URLs in the cap's HTML work.
 func TestBuildServeHTTPHandler_SingleCapFastPath(t *testing.T) {
-	h := buildServeHTTPHandler(nil, true, false, 1, false)
+	h := buildServeHTTPHandler(testCtx(nil, 1, links.ScopeShell, links.ScopeForward))
 	req := httptest.NewRequest("GET", "/", nil)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -116,49 +131,55 @@ func TestBuildServeHTTPHandler_SingleCapFastPath(t *testing.T) {
 	}
 }
 
-// TestLauncherCapBarItems exercises the cap-bar item rules.
-func TestLauncherCapBarItems(t *testing.T) {
+// TestCapBarItems exercises the cap-bar item rules.
+func TestCapBarItems(t *testing.T) {
 	share, err := fileshare.New(t.TempDir())
 	if err != nil {
 		t.Fatalf("fileshare.New: %v", err)
 	}
 
+	all := []string{links.ScopeShell, links.ScopeForward, links.ScopeFiles, links.ScopeProxy}
 	cases := []struct {
 		name             string
 		share            *fileshare.FileShare
-		shellEnabled    bool
-		proxyEnabled    bool
+		caps             []string
 		shellMaxSessions int
 		wantLabels       []string
 	}{
 		{
 			name:             "max=1 hides shell",
 			share:            share,
-			shellEnabled:     true,
-			proxyEnabled:     true,
+			caps:             all,
 			shellMaxSessions: 1,
 			wantLabels:       []string{"Files", "Proxy"},
 		},
 		{
 			name:             "max=0 includes shell",
 			share:            share,
-			shellEnabled:     true,
-			proxyEnabled:     true,
+			caps:             all,
 			shellMaxSessions: 0,
 			wantLabels:       []string{"Shell", "Files", "Proxy"},
 		},
 		{
 			name:             "max=3 includes shell",
 			share:            share,
-			shellEnabled:     true,
-			proxyEnabled:     true,
+			caps:             all,
 			shellMaxSessions: 3,
 			wantLabels:       []string{"Shell", "Files", "Proxy"},
+		},
+		{
+			// forward has no browser side, so a shell+forward listener
+			// offers nothing extra in the dropdown.
+			name:             "forward contributes no menu entry",
+			share:            nil,
+			caps:             []string{links.ScopeShell, links.ScopeForward},
+			shellMaxSessions: 3,
+			wantLabels:       []string{"Shell"},
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := launcherCapBarItems(tc.share, tc.shellEnabled, tc.proxyEnabled, tc.shellMaxSessions)
+			got := capBarItems(testCtx(tc.share, tc.shellMaxSessions, tc.caps...))
 			if len(got) != len(tc.wantLabels) {
 				t.Fatalf("len = %d, want %d (%v)", len(got), len(tc.wantLabels), got)
 			}
