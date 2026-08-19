@@ -317,7 +317,7 @@ func TestAcquireSlotGatesAdmission(t *testing.T) {
 		mu.Lock()
 		defer mu.Unlock()
 		if used >= 1 {
-			return nil, "share already has a controller"
+			return nil, "share is full (max 1 viewers)"
 		}
 		used++
 		var once sync.Once
@@ -348,11 +348,11 @@ func TestAcquireSlotGatesAdmission(t *testing.T) {
 	if err := secondH.OnSYN(second, syn, false); err != nil {
 		t.Fatalf("OnSYN second: %v", err)
 	}
-	if errMsg := second.firstSYN()["error"]; !strings.Contains(errMsg, "controller") {
-		t.Errorf("second peer got error %q, want the controller-busy refusal", errMsg)
+	if errMsg := second.firstSYN()["error"]; !strings.Contains(errMsg, "share is full") {
+		t.Errorf("second peer got error %q, want the busy refusal", errMsg)
 	}
 
-	// Controller disconnects -> the slot frees and the next peer is admitted.
+	// The holder disconnects -> the slot frees and the next peer is admitted.
 	firstH.Close()
 	first.waitFinished(t)
 

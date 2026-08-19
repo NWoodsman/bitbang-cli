@@ -19,6 +19,8 @@ import (
 // in framequeue. Its lock also guards the fields below, which is what
 // keeps publication and teardown ordered.
 type sharePeer struct {
+	clientID string
+
 	q *framequeue.Queue
 
 	conn          *peer.Connection
@@ -29,8 +31,8 @@ type sharePeer struct {
 	refusal       *time.Timer
 }
 
-func newSharePeer() *sharePeer {
-	return &sharePeer{q: framequeue.New(nil, maxPendingPeerBytes)}
+func newSharePeer(clientID string) *sharePeer {
+	return &sharePeer{clientID: clientID, q: framequeue.New(nil, maxPendingPeerBytes)}
 }
 
 // handleMessage routes an inbound data-channel frame to the session,
@@ -138,7 +140,55 @@ func (p *sharePeer) setConn(conn *peer.Connection) {
 	p.q.SetConn(conn)
 }
 
-// roleSlots is the admission counter behind the single-controller rule
+// controlSlot holds the single controller, and hands the keyboard to
+// whoever asks for it last.
+//
+// Refusing the newcomer was the original behavior and it is the wrong
+// way round: the control credential is the keyboard. Someone presenting
+// it has the authority to type, so being told "try again after they
+// disconnect" leaves them with no way in except to find and close the
+// tab still holding it -- which may be on a machine they walked away
+// from. Preempting is also what the signaling layer already does when a
+// second device registers the same UID.
+//
+// Displacing the incumbent is the caller's job, deliberately: it takes
+// time (the outgoing session is told why before its channel closes) and
+// must not happen under this lock.
+type controlSlot struct {
+	mu       sync.Mutex
+	holder   *sharePeer
+	disabled string // non-empty when nobody may hold it, e.g. --read-only
+}
+
+func newControlSlot(disabled string) *controlSlot {
+	return &controlSlot{disabled: disabled}
+}
+
+// take installs p as the controller, returning the peer it displaced (nil
+// when the slot was free) and a release that gives the slot up again. A
+// non-empty refusal means nobody may hold it at all.
+func (c *controlSlot) take(p *sharePeer) (release func(), evicted *sharePeer, refused string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.disabled != "" {
+		return nil, nil, c.disabled
+	}
+	evicted, c.holder = c.holder, p
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			c.mu.Lock()
+			// Only give up the slot if it is still ours: by the time a
+			// preempted peer finishes tearing down, the newcomer holds it.
+			if c.holder == p {
+				c.holder = nil
+			}
+			c.mu.Unlock()
+		})
+	}, evicted, ""
+}
+
+// roleSlots is the admission counter behind
 // and --max-viewers. A slot is taken when a peer is authorized and held
 // for as long as it stays connected. Taking one only when a terminal
 // opens would leave both limits unenforced, since a peer can finish the

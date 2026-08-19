@@ -242,7 +242,8 @@ func TestRevoke_ClosesSessionAtOnceAndConnectionAfter(t *testing.T) {
 	if p.q.IsClosed() {
 		t.Error("connection closed synchronously, before the goodbye could leave")
 	}
-	deadline := time.Now().Add(revokeGrace + 2*time.Second)
+	// session.Goodbye waits for the frame to flush before we close.
+	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		if p.q.IsClosed() {
 			return

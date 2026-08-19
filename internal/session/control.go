@@ -263,6 +263,49 @@ func (s *Session) sendReady() {
 // its post-handshake control handler.
 func (s *Session) SendError(message string) { s.sendControlError(message) }
 
+// goodbyeGrace bounds how long a parting message may take to leave the
+// data channel. Long enough for a frame to clear an ordinary link, short
+// enough that a peer which has already vanished is not waited on.
+const goodbyeGrace = 2 * time.Second
+
+// Goodbye tells the peer why its session is ending and stops serving it,
+// both at once. Pair it with WaitDrained before closing the connection:
+//
+//	sess.Goodbye("this link was revoked")
+//	go func() { sess.WaitDrained(); conn.Close() }()
+//
+// Split in two because the halves have opposite requirements. Ending the
+// session has to be immediate -- it is what stops a peer whose access was
+// just withdrawn from opening anything else -- while the message needs
+// time to leave, and waiting for that on the caller's goroutine would
+// stall whatever loop is walking the peers.
+func (s *Session) Goodbye(reason string) {
+	s.SendError(reason)
+	s.Close()
+}
+
+// WaitDrained blocks until the data channel's send buffer empties, or
+// goodbyeGrace elapses.
+//
+// This is the half that is silent when it is missing. Closing the
+// connection straight after a send discards whatever is still queued: the
+// peer sees only a dead channel, treats it as a network blip, and
+// reconnects, so the reason never arrives and the user is left watching a
+// reconnect that cannot succeed. An empty buffer means pion handed the
+// frame to SCTP rather than that it arrived, and there is no delivery
+// signal to wait on, hence the short settle rather than a race against
+// the wire.
+func (s *Session) WaitDrained() {
+	deadline := time.Now().Add(goodbyeGrace)
+	for time.Now().Before(deadline) {
+		if s.DC == nil || s.DC.BufferedAmount() == 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	time.Sleep(250 * time.Millisecond)
+}
+
 func (s *Session) sendControlError(message string) {
 	errMsg, _ := json.Marshal(map[string]string{
 		"type":    "error",

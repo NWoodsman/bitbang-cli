@@ -78,7 +78,7 @@ type Worker struct {
 	forcedEnv   []string
 	controlWeb  http.Handler
 	viewWeb     http.Handler
-	control     *roleSlots
+	control     *controlSlot
 	viewers     *roleSlots
 
 	// peers owns registration, the concurrent-peer ceiling, and the
@@ -153,13 +153,13 @@ func NewWorker(cfg WorkerConfig) (*Worker, error) {
 		forcedEnv:   AttachEnv(cfg.Env),
 		controlWeb:  shellweb.New().HTTPHandler(),
 		viewWeb:     shellweb.New(shellweb.WithViewOnly()).HTTPHandler(),
-		control:     newRoleSlots(1, "share already has a controller -- try again after they disconnect"),
+		control:     newControlSlot(""),
 		viewers:     newRoleSlots(cfg.MaxViewers, fmt.Sprintf("share is full (max %d viewers)", cfg.MaxViewers)),
 		peers:       peerset.New[*sharePeer](),
 		errs:        make(chan error, 1),
 	}
 	if cfg.ReadOnly {
-		w.control = newRoleSlots(0, "this share is view-only")
+		w.control = newControlSlot("this share is view-only")
 	}
 	w.controlURL = ""
 	if !cfg.ReadOnly {
@@ -346,7 +346,7 @@ func (w *Worker) handleRequest(msg signaling.Message) {
 		return
 	}
 
-	p := newSharePeer()
+	p := newSharePeer(clientID)
 	conn, err := peer.HandleRequest(msg, w.signaling, w.id, p.handleMessage, w.cfg.Verbose)
 	if err != nil {
 		log.Printf("Failed to create peer connection: %v", err)
@@ -419,23 +419,31 @@ func (w *Worker) buildSession(clientID string, p *sharePeer) {
 	sh.ForcedEnv = w.forcedEnv
 
 	var front http.Handler
-	var slots *roleSlots
+	var release func()
+	var busy string
 	switch access {
 	case protocol.AccessControl:
 		sh.ForcedArgv = w.controlArgv
 		front = w.controlWeb
-		slots = w.control
+		var evicted *sharePeer
+		release, evicted, busy = w.control.take(p)
+		if evicted != nil {
+			// The credential says this peer may type, so it types, and
+			// the one that had the keyboard is told why it lost it
+			// rather than just going quiet.
+			log.Printf("Peer %s took control from %s", clientID, evicted.clientID)
+			go w.preempt(evicted)
+		}
 	case protocol.AccessView:
 		sh.ForcedArgv = w.viewArgv
 		sh.ViewOnly = true
 		front = w.viewWeb
-		slots = w.viewers
+		release, busy = w.viewers.acquire()
 	default:
 		w.dropPeer(clientID, p, "answer did not grant a role")
 		return
 	}
 
-	release, busy := slots.acquire()
 	refused := release == nil
 	if refused {
 		log.Printf("Peer %s refused: %s", clientID, busy)
@@ -479,6 +487,20 @@ func (w *Worker) buildSession(clientID string, p *sharePeer) {
 		})
 	}
 	log.Printf("Peer %s authorized: %s", clientID, access)
+}
+
+// preempt ends a controller's session because another connection
+// presented the same control credential. Runs on its own goroutine: the
+// outgoing peer is told why before its channel closes, and the incoming
+// one should not wait for that.
+func (w *Worker) preempt(p *sharePeer) {
+	var sess *session.Session
+	p.q.Locked(func(bool) { sess = p.session })
+	if sess != nil {
+		sess.Goodbye("another connection took control of this share")
+		sess.WaitDrained()
+	}
+	w.dropPeer(p.clientID, p, "preempted by another controller")
 }
 
 // dropPeer tears a peer down and forgets it. Every trigger calls this;

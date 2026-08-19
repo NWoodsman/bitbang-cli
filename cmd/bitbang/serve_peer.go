@@ -110,22 +110,9 @@ func (p *servePeer) close() bool {
 	})
 }
 
-// revokeGrace bounds how long a revoked session's goodbye may take to
-// leave the data channel before the connection is torn down anyway. Long
-// enough for a frame to clear an ordinary link, short enough that a peer
-// that has already vanished is not held open.
-const revokeGrace = 2 * time.Second
-
 // revoke ends a live session because its link no longer permits it,
-// telling the connector why before dropping the channel.
-//
-// The ordering matters and was wrong the first time. Sending and then
-// closing at once discards whatever the data channel still has queued:
-// the connector sees only a dead channel, treats it as a network blip,
-// and reconnects -- so a revoked link produced "Reconnecting..." instead
-// of a reason. Closing the session first is what makes the delay safe;
-// it serves no further streams from that instant, and the connection
-// lingering while the goodbye flushes grants nothing.
+// telling the connector why before dropping the channel. session.Goodbye
+// owns the ordering that makes the message actually arrive.
 func (p *servePeer) revoke(why string) {
 	var sess *session.Session
 	p.q.Locked(func(bool) { sess = p.sess })
@@ -133,24 +120,12 @@ func (p *servePeer) revoke(why string) {
 		p.close()
 		return
 	}
-
-	sess.SendError(why)
-	sess.Close() // no further streams, immediately
+	sess.Goodbye(why) // told, and serving nothing further, right now
 
 	// Off the caller's goroutine: the poll walks every peer, and none of
 	// them should wait on another's socket draining.
 	go func() {
-		deadline := time.Now().Add(revokeGrace)
-		for time.Now().Before(deadline) {
-			if sess.DC == nil || sess.DC.BufferedAmount() == 0 {
-				break
-			}
-			time.Sleep(10 * time.Millisecond)
-		}
-		// An empty send buffer means pion handed the frame to SCTP, not
-		// that it arrived, and there is no delivery signal to wait on.
-		// Give it a moment rather than racing the close against the wire.
-		time.Sleep(250 * time.Millisecond)
+		sess.WaitDrained()
 		p.close()
 	}()
 }
