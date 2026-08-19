@@ -177,7 +177,7 @@ func TestRoleSlots(t *testing.T) {
 
 func TestSharePeerTeardownReleasesOnce(t *testing.T) {
 	var released atomic.Int32
-	p := &sharePeer{}
+	p := newSharePeer()
 	p.hold(func() { released.Add(1) })
 
 	var wins atomic.Int32
@@ -202,7 +202,7 @@ func TestSharePeerTeardownReleasesOnce(t *testing.T) {
 
 func TestSharePeerAdmissionRaceReturnsSlot(t *testing.T) {
 	slots := newRoleSlots(1, "full")
-	p := &sharePeer{}
+	p := newSharePeer()
 	release, _ := slots.acquire()
 	p.teardown()
 	if !p.hold(release) {
@@ -215,7 +215,7 @@ func TestSharePeerAdmissionRaceReturnsSlot(t *testing.T) {
 
 func TestSharePeerEstablishmentDeadlineCanBeCanceled(t *testing.T) {
 	expired := make(chan struct{})
-	p := &sharePeer{}
+	p := newSharePeer()
 	p.armEstablishment(20*time.Millisecond, func() { close(expired) })
 	p.markEstablished()
 	select {
@@ -230,7 +230,7 @@ func TestSharePeerTeardownClosesPublishedShell(t *testing.T) {
 	marker := filepath.Join(t.TempDir(), "started")
 	sh := streamtype.NewShell(nil, false)
 	sh.ForcedArgv = []string{"/bin/sh", "-c", "touch \"$0\"", marker}
-	p := &sharePeer{}
+	p := newSharePeer()
 	if !p.publish(sh, &session.Session{}) {
 		t.Fatal("live peer refused publication")
 	}
@@ -250,7 +250,7 @@ func TestSharePeerTeardownClosesPublishedShell(t *testing.T) {
 
 func TestSharePeerPublishRacesTeardown(t *testing.T) {
 	for i := 0; i < 200; i++ {
-		p := &sharePeer{}
+		p := newSharePeer()
 		sh := streamtype.NewShell(nil, false)
 		var wg sync.WaitGroup
 		var published bool
@@ -265,10 +265,12 @@ func TestSharePeerPublishRacesTeardown(t *testing.T) {
 		}()
 		wg.Wait()
 
-		p.mu.Lock()
-		installed := p.shell
-		closed := p.closed
-		p.mu.Unlock()
+		var installed *streamtype.ShellHandler
+		var closed bool
+		p.q.Locked(func(isClosed bool) {
+			installed = p.shell
+			closed = isClosed
+		})
 		if !closed || published != (installed == sh) {
 			t.Fatalf("iteration %d: published=%v installed=%v closed=%v", i, published, installed == sh, closed)
 		}
@@ -293,11 +295,11 @@ func TestPublishDoesNotDrainOnCallerGoroutine(t *testing.T) {
 	release := make(chan struct{})
 	var once sync.Once
 
-	p := &sharePeer{}
-	p.deliver = func([]byte) {
+	p := newSharePeer()
+	p.q.SetDeliver(func([]byte) {
 		once.Do(func() { close(blocked) })
 		<-release
-	}
+	})
 	defer close(release)
 
 	// A frame is already queued, so the drain has something to park on.
@@ -333,14 +335,14 @@ func TestDrainStopsOnTeardown(t *testing.T) {
 	started := make(chan struct{}, queued)
 	proceed := make(chan struct{})
 
-	p := &sharePeer{}
-	p.deliver = func([]byte) {
+	p := newSharePeer()
+	p.q.SetDeliver(func([]byte) {
 		mu.Lock()
 		delivered++
 		mu.Unlock()
 		started <- struct{}{}
 		<-proceed
-	}
+	})
 	for i := 0; i < queued; i++ {
 		p.handleMessage([]byte("frame"))
 	}
@@ -361,9 +363,7 @@ func TestDrainStopsOnTeardown(t *testing.T) {
 	// starts and cleared in its defer, so once it is false the count is
 	// final and cannot grow under a slower machine.
 	waitFor(t, "the drain goroutine to exit", func() bool {
-		p.mu.Lock()
-		defer p.mu.Unlock()
-		return !p.dispatching
+		return !p.q.Draining()
 	})
 	mu.Lock()
 	got := delivered

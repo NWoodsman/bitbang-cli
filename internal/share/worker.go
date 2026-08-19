@@ -344,7 +344,7 @@ func (w *Worker) handleRequest(msg signaling.Message) {
 		return
 	}
 
-	p := &sharePeer{}
+	p := newSharePeer()
 	conn, err := peer.HandleRequest(msg, w.signaling, w.id, p.handleMessage, w.cfg.Verbose)
 	if err != nil {
 		log.Printf("Failed to create peer connection: %v", err)
