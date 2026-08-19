@@ -182,6 +182,11 @@ func generate() (*Identity, error) {
 	return fromPrivateKeyAndCode(key, code)
 }
 
+// NewAccessCode mints an access code with the same shape as an
+// identity's own: 8 random bytes, 11 base64url chars. Link minting uses
+// it so every code in a table has one derivation and one width.
+func NewAccessCode() (string, error) { return generateAccessCode() }
+
 func generateAccessCode() (string, error) {
 	buf := make([]byte, accessCodeBytes)
 	if _, err := rand.Read(buf); err != nil {
