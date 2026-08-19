@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -358,7 +359,7 @@ func startListener(cfg serveConfig) {
 
 	out := newConsole(url)
 	out.ready()
-	printSharingBlock(cfg, share)
+	printSharingBlock(os.Stdout, cfg, share)
 
 	// PIN status / shell-without-PIN warning.
 	if pinAuth.Required() {
@@ -430,8 +431,12 @@ func launcherCapBarItems(share *fileshare.FileShare, shellEnabled, proxyEnabled 
 
 // printSharingBlock prints the "Sharing:" status block listing each
 // enabled cap with its salient configuration.
-func printSharingBlock(cfg serveConfig, share *fileshare.FileShare) {
-	fmt.Println("Sharing:")
+//
+// Takes a writer so the exact wording can be pinned by a test: this block
+// is the listener's answer to "what did I just expose", and a slip in it
+// is user-visible with nothing else to catch it.
+func printSharingBlock(w io.Writer, cfg serveConfig, share *fileshare.FileShare) {
+	fmt.Fprintln(w, "Sharing:")
 	if cfg.shellEnabled {
 		shellLine := "  • shell  ("
 		if cfg.shellCmd != "" {
@@ -448,29 +453,29 @@ func printSharingBlock(cfg serveConfig, share *fileshare.FileShare) {
 			shellLine += ", mirroring to console"
 		}
 		shellLine += ")"
-		fmt.Println(shellLine)
-		fmt.Printf("  • tcp    (unrestricted targets chosen by connect -L; max %d concurrent connections per session; loopback-bound on connector by default)\n", streamtype.DefaultTCPMaxConcurrent)
+		fmt.Fprintln(w, shellLine)
+		fmt.Fprintf(w, "  • tcp    (unrestricted targets chosen by connect -L; max %d concurrent connections per session; loopback-bound on connector by default)\n", streamtype.DefaultTCPMaxConcurrent)
 	}
 	if cfg.filesEnabled && share != nil {
 		if share.Mode == fileshare.ModeSend {
-			fmt.Printf("  • files  (%s — single file)\n", share.FileName)
+			fmt.Fprintf(w, "  • files  (%s — single file)\n", share.FileName)
 		} else {
 			fileLine := fmt.Sprintf("  • files  (%s", share.BasePath)
 			if share.UploadEnabled {
 				fileLine += ", uploads enabled"
 			}
 			fileLine += ")"
-			fmt.Println(fileLine)
+			fmt.Fprintln(w, fileLine)
 		}
 	}
 	if cfg.proxyEnabled {
 		if cfg.target != "" {
-			fmt.Printf("  • proxy  (%s)\n", cfg.target)
+			fmt.Fprintf(w, "  • proxy  (%s)\n", cfg.target)
 		} else {
-			fmt.Println("  • proxy  (target chosen in browser)")
+			fmt.Fprintln(w, "  • proxy  (target chosen in browser)")
 		}
 	}
-	fmt.Println()
+	fmt.Fprintln(w)
 }
 
 // buildServeHTTPHandler composes the in-process HTTP-cap front-end.
