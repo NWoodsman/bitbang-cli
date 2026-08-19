@@ -116,12 +116,15 @@ func NewClient(server string, id *identity.Identity) *Client {
 // can replace before calling Connect to override.
 func NewClient_MaybeICE(server string, id *identity.Identity, own_ice *[]webrtc.ICEServer) *Client {
 	ws := fmt.Sprintf("wss://%s/ws/device/%s", server, id.UID)
+	ctx, cancel := context.WithCancel(context.Background())
 	return &Client{
-		ID:          id,
-		Server:      server,
-		ServerWS:    ws,
-		OnPreempted: defaultOnPreempted,
-		OwnICEServers: own_ice,
+		ID:          	id,
+		Server:      	server,
+		ServerWS:    	ws,
+		OnPreempted: 	defaultOnPreempted,
+		OwnICEServers: 	own_ice,
+		ctx:		ctx,
+		cancel:		cancel,
 	}
 
 }
