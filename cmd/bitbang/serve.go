@@ -328,11 +328,18 @@ func startListener(cfg serveConfig) {
 			
 		err = json.Unmarshal(fileBytes, &msg)
 		if err != nil {
-			fmt.Printf("Error parsing JSON content: %v\n", err)
+			fmt.Printf("Error unmarshalling ICE JSON content: %v\n", err)
 			os.Exit(1)
 		}
 
-		cfg.iceServers = icehelper.ParseICEServers(msg)
+		iceServersParsed := icehelper.ParseICEServers(msg)
+		
+		if iceServersParsed == nil {
+			fmt.Println("Malformed JSON ICE config. Cannot continue.")
+			os.Exit(1)
+		}
+		
+		cfg.iceServers = iceServersParsed
 		
 	}
 	
@@ -392,13 +399,7 @@ func startListener(cfg serveConfig) {
 		cfg.shellMaxSessions, isAllMode(cfg))
 		
 	
-	var signalingClient *signaling.Client		
-	
-	if cfg.iceServers != nil {
-		signalingClient = signaling.NewClient_WithICE(cfg.server, id, &cfg.iceServers)
-	} else {
-		signalingClient = signaling.NewClient(cfg.server, id)
-	}
+	signalingClient := signaling.NewClient_MaybeICE(cfg.server, id, &cfg.iceServers)
 
 	signalingClient.Verbose = cfg.verbose
 	signalingClient.WantCode = !cfg.nocode

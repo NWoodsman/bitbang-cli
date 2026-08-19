@@ -9,7 +9,6 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
-	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -115,7 +114,7 @@ func NewClient(server string, id *identity.Identity) *Client {
 // ... including custom ICE server config.
 // OnPreempted is initialized to the library default (one log line); host
 // can replace before calling Connect to override.
-func NewClient_WithICE(server string, id *identity.Identity, own_ice *[]webrtc.ICEServer) *Client {
+func NewClient_MaybeICE(server string, id *identity.Identity, own_ice *[]webrtc.ICEServer) *Client {
 	ws := fmt.Sprintf("wss://%s/ws/device/%s", server, id.UID)
 	return &Client{
 		ID:          id,
@@ -312,10 +311,7 @@ func (c *Client) register(conn *websocket.Conn) error {
 		reg["want_code"] = true
 	}
 	if c.OwnICEServers != nil {
-		iceerr := AppendIceServerToMessage(reg,c.OwnICEServers)
-		if iceerr != nil {
-			return fmt.Errorf("serializing ICE server %w", iceerr)
-		}
+		reg["ice_servers"] = &c.OwnICEServers		
 	}
 	c.writeMu.Lock()
 	err := conn.WriteJSON(reg)
@@ -353,26 +349,4 @@ func (c *Client) register(conn *websocket.Conn) error {
 	default:
 		return fmt.Errorf("unexpected message type: %v", msg["type"])
 	}
-}
-
-func AppendIceServerToMessage(msg Message, iceServers *[]webrtc.ICEServer) error {
-
-	if msg == nil {
-		return fmt.Errorf("target message map is nil")
-	}
-	
-	if iceServers == nil || len(*iceServers) == 0 {
-		return nil 
-	}
-
-	jsonBytes, err := json.Marshal(*iceServers)
-	if err != nil {
-		return fmt.Errorf("failed to marshal ice servers slice: %w", err)
-	}
-
-	// 3. Store the serialized JSON string under a single dedicated key
-	// This matches the string-serialized json layout expectation
-	msg["ice_servers"] = string(jsonBytes)
-
-	return nil
 }
