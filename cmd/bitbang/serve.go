@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -13,14 +12,14 @@ import (
 	"sync/atomic"
 	"unicode/utf8"
 
+	"github.com/pion/webrtc/v4"
 	qrcode "github.com/skip2/go-qrcode"
 	"golang.org/x/term"
-	"github.com/pion/webrtc/v4"
 
 	"github.com/richlegrand/bitbang/internal/auth"
 	"github.com/richlegrand/bitbang/internal/fileshare"
-	"github.com/richlegrand/bitbang/internal/identity"
 	"github.com/richlegrand/bitbang/internal/icehelper"
+	"github.com/richlegrand/bitbang/internal/identity"
 	"github.com/richlegrand/bitbang/internal/pairing"
 	"github.com/richlegrand/bitbang/internal/peer"
 	"github.com/richlegrand/bitbang/internal/proxyweb"
@@ -87,11 +86,10 @@ type serveConfig struct {
 	// Files-cap configuration (only set when filesEnabled).
 	filesPath   string
 	filesUpload bool
-	
-	
+
 	// ICE server path
 	iceServersPath string
-	iceServers []webrtc.ICEServer
+	iceServers     []webrtc.ICEServer
 }
 
 // runServe — `bitbang serve` — exposes shell + files + proxy. The
@@ -190,7 +188,6 @@ func runServeProxy(args []string) {
 
 	startListener(cfg)
 }
-
 
 // registerSharedFlags wires --pin, --ephemeral, --server, -v on every
 // mode. They have the same semantics across all four runServe*
@@ -295,55 +292,33 @@ func startListener(cfg serveConfig) {
 	if cfg.shellCmd != "" {
 		shellArgv = []string{cfg.shellCmd}
 	}
-	
-	
+
 	if cfg.iceServersPath != "" {
-		
-		var cleanedPath string
-		
-		cleanedPath = filepath.Clean(cfg.iceServersPath)
-		
-		if !filepath.IsAbs(cleanedPath) {
-			
-			currentDir, err := os.Getwd()
-			
-			if err != nil {
-				fmt.Printf("Error getting working directory during ICE file parsing: %v\n",err)
-				os.Exit(1)
-			}
-			
-			cleanedPath = filepath.Join(currentDir,cleanedPath)
+
+		cleanedPath, err := resolveFSPath(cfg.iceServersPath)
+
+		if err != nil {
+			fmt.Printf("Error getting working directory during ICE file parsing: %v\n", err)
+			os.Exit(1)
 		}
-		
+
 		fileBytes, err := os.ReadFile(cleanedPath)
-		
+
 		if err != nil {
 			fmt.Printf("Error reading ICE server file: %v\n", err)
 			os.Exit(1)
 		}
 
-	
-		msg := make(map[string]interface{})
+		iceServersParsed, err := icehelper.UnMarshalUserIceJson(fileBytes)
 
-			
-		err = json.Unmarshal(fileBytes, &msg)
 		if err != nil {
-			fmt.Printf("Error unmarshalling ICE JSON content: %v\n", err)
+			fmt.Printf("Error unmarshalling user ICE JSON content: %v\n", err)
 			os.Exit(1)
 		}
 
-		iceServersParsed := icehelper.ParseICEServers(msg)
-		
-		if iceServersParsed == nil {
-			fmt.Println("Malformed JSON ICE config. Cannot continue.")
-			os.Exit(1)
-		}
-		
 		cfg.iceServers = iceServersParsed
-		
+
 	}
-	
-		
 
 	pinAuth := auth.New(cfg.pin)
 
@@ -397,12 +372,15 @@ func startListener(cfg serveConfig) {
 
 	httpFront := buildServeHTTPHandler(share, cfg.shellEnabled, cfg.proxyEnabled,
 		cfg.shellMaxSessions, isAllMode(cfg))
-		
-	
-	signalingClient := signaling.NewClient_MaybeICE(cfg.server, id, &cfg.iceServers)
+
+	signalingClient := signaling.NewClient(cfg.server, id)
+
+	signalingClient.OwnICEServers = &cfg.iceServers
 
 	signalingClient.Verbose = cfg.verbose
+
 	signalingClient.WantCode = !cfg.nocode
+
 	// Override the library default: for a CLI listener, the right
 	// response to preemption is to print a clear line and exit. The
 	// library-internal reconnect-storm prevention is unaffected by this
@@ -921,4 +899,32 @@ func buildServeHTTPHandler(share *fileshare.FileShare, shellEnabled, proxyEnable
 		}
 		mux.ServeHTTP(w, r)
 	})
+}
+
+// A simple helper function to confirm that a file system path is converted into it's absolute form,
+// even if the user hands in a home-rooted path.
+func resolveFSPath(path string) (string, error) {
+
+	var cleanedPath string
+
+	if strings.HasPrefix(path, "~") {
+
+		hpath, err := os.UserHomeDir()
+
+		if err != nil {
+			return "", fmt.Errorf("failed to find given ICE path: %s", path)
+		}
+
+		cleanedPath = filepath.Join(hpath, path[2:])
+
+		return cleanedPath, nil
+
+	} else if !filepath.IsAbs(path) {
+		cleanedPath, err := filepath.Abs(path)
+
+		return cleanedPath, err
+	} else {
+		return path, nil
+	}
+
 }

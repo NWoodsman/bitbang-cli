@@ -141,7 +141,7 @@ func runPairConnect(code, server string, verbose, relay bool) remoteSpec {
 	// instead of only on the same LAN. (The CLI has no lazy request_ice
 	// fallback, just like the direct flow, so the hard ~25% would need
 	// force_relay; that isn't wired into pairing yet.)
-	iceServers := icehelper.ParseICEServers(offer)
+	iceServers := icehelper.AnyToICEServers(offer["ice_servers"].([]any))
 	p, err := client.NewPairPeer(iceServers)
 	if err != nil {
 		fail("connect: new peer: %v", err)
@@ -307,4 +307,3 @@ func handlePairOutcome(r pairOutcome, server string) remoteSpec {
 		Code:   r.accessCode,
 	}
 }
-

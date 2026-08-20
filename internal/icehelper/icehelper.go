@@ -8,9 +8,21 @@ package icehelper
 
 import (
 	"encoding/json"
-
+	"fmt"
 	"github.com/pion/webrtc/v4"
+	"strings"
 )
+
+// Takes an array of []any and converts to ICEServers, if possible.
+func AnyToICEServers(raw []any) []webrtc.ICEServer {
+	data, err := json.Marshal(raw)
+	if err != nil {
+		return nil
+	}
+
+	return parseICEServers(data)
+
+}
 
 // ParseICEServers reads the "ice_servers" field of a signaling message
 // and returns it as pion's []webrtc.ICEServer. The input is the full
@@ -21,23 +33,14 @@ import (
 // The browser-native wire format allows urls to be either a string or
 // a []string; both are accepted. A Username triggers password-credential
 // type (the only one pion supports for trickle ICE).
-func ParseICEServers(msg map[string]interface{}) []webrtc.ICEServer {
-	raw, ok := msg["ice_servers"]
-	if !ok {
-		return nil
-	}
-	// ice_servers arrives as []interface{} from JSON unmarshaling; re-marshal
-	// + unmarshal into a typed struct is simplest.
-	data, err := json.Marshal(raw)
-	if err != nil {
-		return nil
-	}
+func parseICEServers(raw []byte) []webrtc.ICEServer {
+
 	var entries []struct {
 		URLs       interface{} `json:"urls"`
 		Username   string      `json:"username"`
 		Credential string      `json:"credential"`
 	}
-	if err := json.Unmarshal(data, &entries); err != nil {
+	if err := json.Unmarshal(raw, &entries); err != nil {
 		return nil
 	}
 	var out []webrtc.ICEServer
@@ -94,4 +97,57 @@ func CandidateMap(c *webrtc.ICECandidate) map[string]interface{} {
 		"sdpMid":        j.SDPMid,
 		"sdpMLineIndex": j.SDPMLineIndex,
 	}
+}
+
+func UnMarshalUserIceJson(data []byte) ([]webrtc.ICEServer, error) {
+
+	var parsed []webrtc.ICEServer
+
+	// Clean up leading whitespace to check the root structural token safely
+	trimmed := strings.TrimSpace(string(data))
+	if len(trimmed) == 0 {
+		return nil, fmt.Errorf("empty ICE config file. ")
+	}
+
+	// Case 3: The payload is a direct raw array -> [{...}]
+	if trimmed[0] == '[' {
+
+		if parsed = parseICEServers(data); parsed == nil {
+			return nil, fmt.Errorf("Not a valid ICE config file.")
+		}
+
+		return parsed, nil
+	}
+
+	// Case 1 & 2: The payload is an object wrapper -> {"ice_servers": ...} or {"iceServers": ...}
+	if trimmed[0] == '{' {
+		var wrapper map[string]json.RawMessage
+		// Use json.RawMessage to hold keys without decoding their bodies yet
+		if err := json.Unmarshal(data, &wrapper); err != nil {
+			return nil, err
+		}
+
+		// Look for either key variation dynamically
+		if rawArray, exists := wrapper["ice_servers"]; exists {
+
+			if parsed = parseICEServers(rawArray); parsed == nil {
+				return nil, fmt.Errorf("ice_servers JSON node did not parse to an array of ICE configs.")
+			}
+
+			return parsed, nil
+
+		}
+		if rawArray, exists := wrapper["iceServers"]; exists {
+
+			if parsed = parseICEServers(rawArray); parsed == nil {
+				return nil, fmt.Errorf("iceServers JSON node did not parse to an array of ICE configs.")
+			}
+
+			return parsed, nil
+
+		}
+	}
+
+	// Fail cleanly if the payload format does not match any expected structure
+	return nil, fmt.Errorf("unexpected JSON format for ICE servers configuration")
 }

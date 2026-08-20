@@ -221,7 +221,7 @@ type connSetup struct {
 func setupConnection(s connSetup) (*Connection, error) {
 	connStart := time.Now()
 
-	iceServers := icehelper.ParseICEServers(s.msg)
+	iceServers := icehelper.AnyToICEServers(s.msg["ice_servers"].([]any))
 
 	// Single-phase ICE bias toward direct: the device is the offerer and thus
 	// the ICE-controlling agent, so the candidate-pair nomination decision is

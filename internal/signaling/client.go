@@ -21,9 +21,8 @@ import (
 
 	"github.com/richlegrand/bitbang/internal/identity"
 	"github.com/richlegrand/bitbang/internal/protocol"
-	
-	"github.com/pion/webrtc/v4"
 
+	"github.com/pion/webrtc/v4"
 )
 
 // Message is a generic signaling message.
@@ -38,7 +37,7 @@ type Client struct {
 	Server   string // hostname, e.g. "bitba.ng"
 	ServerWS string // full URL, e.g. "wss://bitba.ng/ws/device/<uid>"
 	Verbose  bool
-	
+
 	// A pre-parsed user-supplied 'own' ICE server config
 	OwnICEServers *[]webrtc.ICEServer
 
@@ -109,25 +108,6 @@ func NewClient(server string, id *identity.Identity) *Client {
 	}
 }
 
-
-// NewClient_WithICE creates a signaling client for the given server and identity
-// ... including custom ICE server config.
-// OnPreempted is initialized to the library default (one log line); host
-// can replace before calling Connect to override.
-func NewClient_MaybeICE(server string, id *identity.Identity, own_ice *[]webrtc.ICEServer) *Client {
-	ws := fmt.Sprintf("wss://%s/ws/device/%s", server, id.UID)
-	ctx, cancel := context.WithCancel(context.Background())
-	return &Client{
-		ID:          	id,
-		Server:      	server,
-		ServerWS:    	ws,
-		OnPreempted: 	defaultOnPreempted,
-		OwnICEServers: 	own_ice,
-		ctx:		ctx,
-		cancel:		cancel,
-	}
-
-}
 // defaultOnPreempted is the library-default OnPreempted callback. Logs
 // a single line and returns; the storm-breaker (preempted flag check in
 // Connect) is what actually stops the reconnect loop. CLI binaries
@@ -313,8 +293,8 @@ func (c *Client) register(conn *websocket.Conn) error {
 	if c.WantCode {
 		reg["want_code"] = true
 	}
-	if c.OwnICEServers != nil {
-		reg["ice_servers"] = &c.OwnICEServers		
+	if len(*c.OwnICEServers) > 0 {
+		reg["ice_servers"] = c.OwnICEServers
 	}
 	c.writeMu.Lock()
 	err := conn.WriteJSON(reg)
