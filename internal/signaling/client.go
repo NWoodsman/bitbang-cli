@@ -19,10 +19,10 @@ import (
 	"github.com/gorilla/websocket"
 	"golang.org/x/term"
 
+	"github.com/pion/webrtc/v4"
+
 	"github.com/richlegrand/bitbang/internal/identity"
 	"github.com/richlegrand/bitbang/internal/protocol"
-
-	"github.com/pion/webrtc/v4"
 )
 
 // Message is a generic signaling message.
@@ -38,8 +38,10 @@ type Client struct {
 	ServerWS string // full URL, e.g. "wss://bitba.ng/ws/device/<uid>"
 	Verbose  bool
 
-	// A pre-parsed user-supplied 'own' ICE server config
-	OwnICEServers *[]webrtc.ICEServer
+	// OwnICEServers is a pre-parsed operator-supplied ICE server config
+	// (--ice-servers). Empty means "let the server decide"; a slice is
+	// already nilable, so every caller that ignores this field is fine.
+	OwnICEServers []webrtc.ICEServer
 
 	// WantCode, when true, asks the server to issue a short 6-digit pairing
 	// code at register time. The server returns it in the `registered`
@@ -293,7 +295,7 @@ func (c *Client) register(conn *websocket.Conn) error {
 	if c.WantCode {
 		reg["want_code"] = true
 	}
-	if len(*c.OwnICEServers) > 0 {
+	if len(c.OwnICEServers) > 0 {
 		reg["ice_servers"] = c.OwnICEServers
 	}
 	c.writeMu.Lock()

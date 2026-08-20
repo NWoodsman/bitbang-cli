@@ -9,32 +9,45 @@ package icehelper
 import (
 	"encoding/json"
 	"fmt"
-	"github.com/pion/webrtc/v4"
 	"strings"
+
+	"github.com/pion/webrtc/v4"
 )
 
-// Takes an array of []any and converts to ICEServers, if possible.
+// FromMessage reads the "ice_servers" field of a signaling message and
+// returns it as pion's []webrtc.ICEServer. The input is the full message
+// (map[string]interface{}); a missing or malformed ice_servers returns
+// nil — callers that need the empty/missing distinction should check
+// msg["ice_servers"] themselves.
+//
+// Missing is a normal state, not an error: the server drops the field
+// when it has no STUN to stamp, and omits it from an offer when TURN is
+// unavailable. Both mean "gather host candidates only".
+func FromMessage(msg map[string]interface{}) []webrtc.ICEServer {
+	raw, _ := msg["ice_servers"].([]any)
+	if raw == nil {
+		return nil
+	}
+	return AnyToICEServers(raw)
+}
+
+// AnyToICEServers converts an already-decoded ice_servers array to pion's
+// typed form. Re-marshaling and unmarshaling into a typed struct is the
+// simplest way across; a malformed entry yields nil.
 func AnyToICEServers(raw []any) []webrtc.ICEServer {
 	data, err := json.Marshal(raw)
 	if err != nil {
 		return nil
 	}
-
 	return parseICEServers(data)
-
 }
 
-// ParseICEServers reads the "ice_servers" field of a signaling message
-// and returns it as pion's []webrtc.ICEServer. The input is the full
-// message (map[string]interface{}); a missing or malformed ice_servers
-// returns nil — callers that need the empty/missing distinction should
-// check msg["ice_servers"] themselves.
+// parseICEServers decodes a JSON ice_servers array.
 //
 // The browser-native wire format allows urls to be either a string or
 // a []string; both are accepted. A Username triggers password-credential
 // type (the only one pion supports for trickle ICE).
 func parseICEServers(raw []byte) []webrtc.ICEServer {
-
 	var entries []struct {
 		URLs       interface{} `json:"urls"`
 		Username   string      `json:"username"`
@@ -67,6 +80,49 @@ func parseICEServers(raw []byte) []webrtc.ICEServer {
 	return out
 }
 
+// ParseUserICEFile reads an operator-supplied --ice-servers file. Three
+// shapes are accepted, so a config lifted from a TURN provider's docs or
+// from browser code works without editing: a bare array, an object with
+// "ice_servers" (our wire spelling), or one with "iceServers" (the
+// RTCConfiguration spelling).
+func ParseUserICEFile(data []byte) ([]webrtc.ICEServer, error) {
+	// Check the root structural token, ignoring leading whitespace.
+	trimmed := strings.TrimSpace(string(data))
+	if trimmed == "" {
+		return nil, fmt.Errorf("empty ICE config file")
+	}
+
+	if trimmed[0] == '[' {
+		parsed := parseICEServers(data)
+		if parsed == nil {
+			return nil, fmt.Errorf("not a valid ICE server array")
+		}
+		return parsed, nil
+	}
+
+	if trimmed[0] == '{' {
+		// json.RawMessage holds the keys without decoding their bodies yet.
+		var wrapper map[string]json.RawMessage
+		if err := json.Unmarshal(data, &wrapper); err != nil {
+			return nil, err
+		}
+		for _, key := range []string{"ice_servers", "iceServers"} {
+			rawArray, exists := wrapper[key]
+			if !exists {
+				continue
+			}
+			parsed := parseICEServers(rawArray)
+			if parsed == nil {
+				return nil, fmt.Errorf("%s did not parse to an array of ICE servers", key)
+			}
+			return parsed, nil
+		}
+	}
+
+	return nil, fmt.Errorf("unexpected JSON format: want an array of ICE servers, " +
+		"or an object with an ice_servers or iceServers key")
+}
+
 // CandidateInit converts a JSON-decoded RTCIceCandidate-shaped object
 // (as sent by browsers via signaling) to pion's init form. Returns
 // ok=false for the empty/end-of-candidates marker so callers can no-op
@@ -97,57 +153,4 @@ func CandidateMap(c *webrtc.ICECandidate) map[string]interface{} {
 		"sdpMid":        j.SDPMid,
 		"sdpMLineIndex": j.SDPMLineIndex,
 	}
-}
-
-func UnMarshalUserIceJson(data []byte) ([]webrtc.ICEServer, error) {
-
-	var parsed []webrtc.ICEServer
-
-	// Clean up leading whitespace to check the root structural token safely
-	trimmed := strings.TrimSpace(string(data))
-	if len(trimmed) == 0 {
-		return nil, fmt.Errorf("empty ICE config file. ")
-	}
-
-	// Case 3: The payload is a direct raw array -> [{...}]
-	if trimmed[0] == '[' {
-
-		if parsed = parseICEServers(data); parsed == nil {
-			return nil, fmt.Errorf("Not a valid ICE config file.")
-		}
-
-		return parsed, nil
-	}
-
-	// Case 1 & 2: The payload is an object wrapper -> {"ice_servers": ...} or {"iceServers": ...}
-	if trimmed[0] == '{' {
-		var wrapper map[string]json.RawMessage
-		// Use json.RawMessage to hold keys without decoding their bodies yet
-		if err := json.Unmarshal(data, &wrapper); err != nil {
-			return nil, err
-		}
-
-		// Look for either key variation dynamically
-		if rawArray, exists := wrapper["ice_servers"]; exists {
-
-			if parsed = parseICEServers(rawArray); parsed == nil {
-				return nil, fmt.Errorf("ice_servers JSON node did not parse to an array of ICE configs.")
-			}
-
-			return parsed, nil
-
-		}
-		if rawArray, exists := wrapper["iceServers"]; exists {
-
-			if parsed = parseICEServers(rawArray); parsed == nil {
-				return nil, fmt.Errorf("iceServers JSON node did not parse to an array of ICE configs.")
-			}
-
-			return parsed, nil
-
-		}
-	}
-
-	// Fail cleanly if the payload format does not match any expected structure
-	return nil, fmt.Errorf("unexpected JSON format for ICE servers configuration")
 }

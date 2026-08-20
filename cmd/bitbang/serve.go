@@ -294,30 +294,18 @@ func startListener(cfg serveConfig) {
 	}
 
 	if cfg.iceServersPath != "" {
-
-		cleanedPath, err := resolveFSPath(cfg.iceServersPath)
-
+		path, err := resolveFSPath(cfg.iceServersPath)
 		if err != nil {
-			fmt.Printf("Error getting working directory during ICE file parsing: %v\n", err)
-			os.Exit(1)
+			fail("serve: %v", err)
 		}
-
-		fileBytes, err := os.ReadFile(cleanedPath)
-
+		fileBytes, err := os.ReadFile(path)
 		if err != nil {
-			fmt.Printf("Error reading ICE server file: %v\n", err)
-			os.Exit(1)
+			fail("serve: read ICE server file: %v", err)
 		}
-
-		iceServersParsed, err := icehelper.UnMarshalUserIceJson(fileBytes)
-
+		cfg.iceServers, err = icehelper.ParseUserICEFile(fileBytes)
 		if err != nil {
-			fmt.Printf("Error unmarshalling user ICE JSON content: %v\n", err)
-			os.Exit(1)
+			fail("serve: %s: %v", path, err)
 		}
-
-		cfg.iceServers = iceServersParsed
-
 	}
 
 	pinAuth := auth.New(cfg.pin)
@@ -374,13 +362,9 @@ func startListener(cfg serveConfig) {
 		cfg.shellMaxSessions, isAllMode(cfg))
 
 	signalingClient := signaling.NewClient(cfg.server, id)
-
-	signalingClient.OwnICEServers = &cfg.iceServers
-
+	signalingClient.OwnICEServers = cfg.iceServers
 	signalingClient.Verbose = cfg.verbose
-
 	signalingClient.WantCode = !cfg.nocode
-
 	// Override the library default: for a CLI listener, the right
 	// response to preemption is to print a clear line and exit. The
 	// library-internal reconnect-storm prevention is unaffected by this
@@ -901,30 +885,16 @@ func buildServeHTTPHandler(share *fileshare.FileShare, shellEnabled, proxyEnable
 	})
 }
 
-// A simple helper function to confirm that a file system path is converted into it's absolute form,
-// even if the user hands in a home-rooted path.
+// resolveFSPath turns a user-supplied path into an absolute one,
+// expanding a leading ~ against the home directory. filepath.Abs already
+// returns an absolute path unchanged, so that is the whole job.
 func resolveFSPath(path string) (string, error) {
-
-	var cleanedPath string
-
-	if strings.HasPrefix(path, "~") {
-
-		hpath, err := os.UserHomeDir()
-
+	if path == "~" || strings.HasPrefix(path, "~/") {
+		home, err := os.UserHomeDir()
 		if err != nil {
-			return "", fmt.Errorf("failed to find given ICE path: %s", path)
+			return "", fmt.Errorf("resolve %s: %w", path, err)
 		}
-
-		cleanedPath = filepath.Join(hpath, path[2:])
-
-		return cleanedPath, nil
-
-	} else if !filepath.IsAbs(path) {
-		cleanedPath, err := filepath.Abs(path)
-
-		return cleanedPath, err
-	} else {
-		return path, nil
+		return filepath.Join(home, strings.TrimPrefix(path[1:], "/")), nil
 	}
-
+	return filepath.Abs(path)
 }
