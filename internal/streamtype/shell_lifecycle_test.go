@@ -3,6 +3,7 @@ package streamtype
 import (
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"strings"
@@ -257,5 +258,36 @@ func TestShellAdmissionsReleaseIsIdempotent(t *testing.T) {
 	a.release(other)
 	if got := a.count(); got != 0 {
 		t.Fatalf("count = %d, want 0", got)
+	}
+}
+
+// A command that exits before its output pump is scheduled must still
+// deliver what it printed.
+//
+// It did not: pipe mode used cmd.StdoutPipe, and Wait -- which runs
+// concurrently with the pump -- closes those pipes on process exit, so
+// anything unread was gone. Go's own documentation says calling Wait
+// before reads complete is incorrect. The visible effect was
+// `bitbang connect URL -- cmd` silently dropping the command's output,
+// and it lost a full 100% of it whenever the pump was even a millisecond
+// late.
+//
+// Repeated because the old failure was a scheduling race that usually
+// went the right way: at roughly one loss in five, fifty rounds make a
+// pass on broken code about a one-in-seventy-thousand event.
+func TestPipeModeDeliversOutputOfAFastExitingCommand(t *testing.T) {
+	skipIfWindows(t)
+	const rounds = 50
+	for i := 0; i < rounds; i++ {
+		h := NewShell([]string{"/bin/echo", "delivered"}, false)
+		s := newShellCapture()
+		syn, _ := json.Marshal(shellOpen{Type: "shell"})
+		if err := h.OnSYN(s, syn, false); err != nil {
+			t.Fatalf("round %d: OnSYN: %v", i, err)
+		}
+		s.waitFinished(t)
+		if out := s.stdout(); !strings.Contains(out, "delivered") {
+			t.Fatalf("round %d: output %q lost the command's stdout", i, out)
+		}
 	}
 }

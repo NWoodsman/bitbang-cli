@@ -374,8 +374,12 @@ type shellSession struct {
 	process *os.Process    // process behind either command type
 	ptyFile ptylib.Pty     // PTY mode: master side, used for read + write
 	stdin   io.WriteCloser // pipe mode: dedicated stdin pipe
-	output  *shellOutput   // drain output before FIN and terminal close
-	done    chan struct{}
+	// pipes are the read ends we own in pipe mode. Closed once output is
+	// drained, which also unblocks a pump still waiting on a descriptor
+	// some grandchild inherited and kept open.
+	pipes  []*os.File
+	output *shellOutput // drain output before FIN and terminal close
+	done   chan struct{}
 }
 
 func (s *shellSession) wait() error {
@@ -641,35 +645,51 @@ func (h *ShellHandler) OnSYN(s Stream, payload []byte, final bool) error {
 			h.sendShellError(s, "stdin pipe: "+err.Error())
 			return nil
 		}
-		sout, err := cmd.StdoutPipe()
+		// os.Pipe rather than cmd.StdoutPipe: Wait closes the pipes
+		// StdoutPipe hands out, and it runs concurrently with the pumps
+		// reading them, so a command that exits before its pump is
+		// scheduled loses its output outright. Owning both ends means
+		// Wait cannot take the read end away mid-read, and EOF still
+		// arrives on its own once every writer is gone -- the child's
+		// copy when it exits, ours immediately after Start.
+		outR, outW, err := os.Pipe()
 		if err != nil {
 			_ = sin.Close()
 			h.mu.Unlock()
 			h.sendShellError(s, "stdout pipe: "+err.Error())
 			return nil
 		}
-		serr, err := cmd.StderrPipe()
+		errR, errW, err := os.Pipe()
 		if err != nil {
 			_ = sin.Close()
+			_ = outR.Close()
+			_ = outW.Close()
 			h.mu.Unlock()
 			h.sendShellError(s, "stderr pipe: "+err.Error())
 			return nil
 		}
+		cmd.Stdout = outW
+		cmd.Stderr = errW
 		if err := cmd.Start(); err != nil {
-			// Wait never runs, so the parent ends of the pipes are
-			// ours to close.
 			_ = sin.Close()
-			_ = sout.Close()
-			_ = serr.Close()
+			_ = outR.Close()
+			_ = outW.Close()
+			_ = errR.Close()
+			_ = errW.Close()
 			h.mu.Unlock()
 			h.sendShellError(s, "spawn failed: "+err.Error())
 			return nil
 		}
+		// The child holds its own copies now. Dropping ours is what
+		// lets the reader see EOF when the child goes.
+		_ = outW.Close()
+		_ = errW.Close()
 		sess.cmd = cmd
 		sess.process = cmd.Process
 		sess.stdin = sin
-		stdout = sout
-		stderr = serr
+		sess.pipes = []*os.File{outR, errR}
+		stdout = outR
+		stderr = errR
 	}
 
 	h.streams[s.ID()] = sess
@@ -889,6 +909,12 @@ func (h *ShellHandler) waitAndFinish(s Stream, running *shellSession, argv []str
 	}
 	if !drained {
 		log.Printf("Shell output drain timed out: argv=%v", argv)
+	}
+	// Now that the pumps are done with them -- or have been given up on
+	// -- release the read ends. A pump still blocked on one is unblocked
+	// by this, which is what Wait used to do before we owned them.
+	for _, f := range running.pipes {
+		_ = f.Close()
 	}
 
 	exitCode := 0
