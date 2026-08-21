@@ -75,3 +75,59 @@ func TestReadyOmitsAccessWhenUnset(t *testing.T) {
 		t.Errorf("ready included an access field with no role set: %v", msg)
 	}
 }
+
+// typedHandler is a stub that claims one stream type, for asserting what
+// the listener advertises.
+type typedHandler struct{ typ string }
+
+func (h typedHandler) Type() string                                { return h.typ }
+func (h typedHandler) OnConnect(string) error                      { return nil }
+func (h typedHandler) OnSYN(streamtype.Stream, []byte, bool) error { return nil }
+func (h typedHandler) OnDAT(streamtype.Stream, []byte) error       { return nil }
+func (h typedHandler) OnFIN(streamtype.Stream, []byte) error       { return nil }
+
+// TestReadyCapsAreExactlyTheRegisteredHandlers is what lets a listener
+// enforce a per-link scope by choosing the handler set: the caps a
+// connector sees have to be that set and nothing else. Grant a subset
+// and the connector must be told about the subset, so `bitbang connect`
+// fails with "listener does not advertise the 'shell' capability"
+// instead of hanging on a stream nobody will answer.
+func TestReadyCapsAreExactlyTheRegisteredHandlers(t *testing.T) {
+	handlers := map[string]streamtype.StreamHandler{
+		"file": typedHandler{"file"},
+		"http": typedHandler{"http"},
+	}
+	sess := &Session{
+		PIN:      auth.New(""),
+		handlers: handlers,
+		streams:  make(map[uint32]*streamState),
+		done:     make(chan struct{}),
+	}
+	t.Cleanup(sess.Close)
+
+	var ready map[string]interface{}
+	sess.sendFrame = func(streamID uint32, flags uint16, payload []byte) error {
+		var peek struct {
+			Type string `json:"type"`
+		}
+		_ = json.Unmarshal(payload, &peek)
+		if streamID == 0 && peek.Type == "ready" {
+			_ = json.Unmarshal(payload, &ready)
+		}
+		return nil
+	}
+	sess.HandleMessage(protocol.BuildFrame(0, protocol.FlagSYN,
+		[]byte(`{"type":"connect","path":"/","version":3}`)))
+
+	if ready == nil {
+		t.Fatal("listener never sent a ready message")
+	}
+	raw, _ := ready["caps"].([]interface{})
+	var caps []string
+	for _, c := range raw {
+		caps = append(caps, c.(string))
+	}
+	if len(caps) != 2 || caps[0] != "file" || caps[1] != "http" {
+		t.Errorf("caps = %v, want exactly the registered handlers [file http]", caps)
+	}
+}

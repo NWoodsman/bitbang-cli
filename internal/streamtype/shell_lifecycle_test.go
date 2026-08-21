@@ -3,6 +3,7 @@ package streamtype
 import (
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"strings"
@@ -117,22 +118,22 @@ func TestWaitAndFinishBackpressureStillCompletesSession(t *testing.T) {
 	terminal := &synchronizedLifecyclePTY{}
 	sess := &shellSession{cmd: cmd, process: cmd.Process, ptyFile: terminal, output: output, done: make(chan struct{})}
 	h.streams[stream.id] = sess
-	previousActive := activeShellCount.Swap(1)
-	defer activeShellCount.Store(previousActive)
+	adm, _ := liveShells.admit(0)
+	defer liveShells.release(adm)
 
 	go func() {
 		defer output.Done()
 		h.pumpReader(stream, strings.NewReader("blocked"), shellTagStdout, output.cancelled())
 	}()
-	go h.waitAndFinish(stream, sess, []string{"helper"}, func() { activeShellCount.Add(-1) })
+	go h.waitAndFinish(stream, sess, []string{"helper"}, func() { liveShells.release(adm) })
 
 	select {
 	case <-stream.fin:
 	case <-time.After(2 * time.Second):
 		t.Fatal("waitAndFinish did not send FIN after bounded output drain")
 	}
-	if got := activeShellCount.Load(); got != 0 {
-		t.Fatalf("active shell count = %d, want 0", got)
+	if got := liveShells.count(); got != 0 {
+		t.Fatalf("live shell count = %d, want 0 -- the admission was not released", got)
 	}
 	h.mu.Lock()
 	_, stillMapped := h.streams[stream.id]
@@ -192,5 +193,101 @@ func TestDetachSessionSerializesPTYUse(t *testing.T) {
 	}
 	if got := terminal.resizeCount.Load(); got != 1 {
 		t.Fatalf("resize calls = %d, want 1 after detachment", got)
+	}
+}
+
+// With the default of one session, a shell left open somewhere used to
+// lock the credential holder out of their own listener. The newcomer
+// takes it instead, and the displaced one is named so the caller can end
+// it.
+func TestShellAdmissionsDisplaceTheOldest(t *testing.T) {
+	var a shellAdmissions
+
+	first, displaced := a.admit(1)
+	if displaced != nil {
+		t.Fatal("an empty list reported displacing someone")
+	}
+	second, displaced := a.admit(1)
+	if displaced != first {
+		t.Fatalf("displaced = %v, want the shell that was already live", displaced)
+	}
+	// The displaced shell gives up its slot at once, so a third arrival
+	// throws out `second` rather than the shell that just took over.
+	if got := a.count(); got != 1 {
+		t.Fatalf("count = %d, want only the newcomer holding a slot", got)
+	}
+	a.release(first) // its stream finishing later must not disturb anything
+	if got := a.count(); got != 1 {
+		t.Fatalf("count = %d after the displaced stream ended, want 1", got)
+	}
+
+	// Oldest-first, not newest-first: the one still working should not be
+	// the one thrown out.
+	third, displaced := a.admit(1)
+	if displaced != second {
+		t.Fatal("displaced the wrong shell; eviction must be oldest-first")
+	}
+	a.release(second)
+	a.release(third)
+	if got := a.count(); got != 0 {
+		t.Fatalf("count = %d after everything released, want 0", got)
+	}
+}
+
+func TestShellAdmissionsUnlimited(t *testing.T) {
+	var a shellAdmissions
+	for i := 0; i < 5; i++ {
+		if _, displaced := a.admit(0); displaced != nil {
+			t.Fatalf("admission %d displaced someone with no limit set", i)
+		}
+	}
+	if got := a.count(); got != 5 {
+		t.Fatalf("count = %d, want 5", got)
+	}
+}
+
+func TestShellAdmissionsReleaseIsIdempotent(t *testing.T) {
+	var a shellAdmissions
+	adm, _ := a.admit(2)
+	other, _ := a.admit(2)
+	a.release(adm)
+	a.release(adm) // a displaced shell's stream ending after it was evicted
+	if got := a.count(); got != 1 {
+		t.Fatalf("count = %d, want the other shell still held", got)
+	}
+	a.release(other)
+	if got := a.count(); got != 0 {
+		t.Fatalf("count = %d, want 0", got)
+	}
+}
+
+// A command that exits before its output pump is scheduled must still
+// deliver what it printed.
+//
+// It did not: pipe mode used cmd.StdoutPipe, and Wait -- which runs
+// concurrently with the pump -- closes those pipes on process exit, so
+// anything unread was gone. Go's own documentation says calling Wait
+// before reads complete is incorrect. The visible effect was
+// `bitbang connect URL -- cmd` silently dropping the command's output,
+// and it lost a full 100% of it whenever the pump was even a millisecond
+// late.
+//
+// Repeated because the old failure was a scheduling race that usually
+// went the right way: at roughly one loss in five, fifty rounds make a
+// pass on broken code about a one-in-seventy-thousand event.
+func TestPipeModeDeliversOutputOfAFastExitingCommand(t *testing.T) {
+	skipIfWindows(t)
+	const rounds = 50
+	for i := 0; i < rounds; i++ {
+		h := NewShell([]string{"/bin/echo", "delivered"}, false)
+		s := newShellCapture()
+		syn, _ := json.Marshal(shellOpen{Type: "shell"})
+		if err := h.OnSYN(s, syn, false); err != nil {
+			t.Fatalf("round %d: OnSYN: %v", i, err)
+		}
+		s.waitFinished(t)
+		if out := s.stdout(); !strings.Contains(out, "delivered") {
+			t.Fatalf("round %d: output %q lost the command's stdout", i, out)
+		}
 	}
 }

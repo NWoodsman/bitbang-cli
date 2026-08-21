@@ -50,6 +50,8 @@ func main() {
 		dispatchServe(os.Args[2:])
 	case "share":
 		dispatchShare(os.Args[2:])
+	case "link":
+		dispatchLink(os.Args[2:])
 	case "cp":
 		runCp(os.Args[2:])
 	case "connect":
@@ -98,6 +100,7 @@ func printUsage() {
 	fmt.Println("  bitbang serve proxy [flags]            Proxy only (HTTP reverse proxy)")
 	fmt.Println("  bitbang share [flags]                  Publish the current tmux session as a URL")
 	fmt.Println("  bitbang share status|stop|rotate       Manage a running share")
+	fmt.Println("  bitbang link ls|edit|rm|qr             Manage a listener's access links")
 	fmt.Println("  bitbang cp <src> <dst>                 Copy files (one side is <URL>:/path, or '-')")
 	fmt.Println("  bitbang connect <URL-or-code> [-- ...]  Open a shell or run a command")
 	fmt.Println("  bitbang connect <URL-or-code> -L port:host:port [-L ...] [-g]")

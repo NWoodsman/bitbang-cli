@@ -113,7 +113,7 @@ func Dial(opts DialOptions) (*Session, error) {
 	// --relay forces relay-only gathering on the connector; otherwise we
 	// trickle every candidate immediately and the device (ICE-controlling)
 	// biases toward direct. See internal/peer relayAcceptanceMinWait.
-	peer, err := NewPeer(opts.UID, opts.Code, iceServers, opts.ForceRelay)
+	peer, err := NewPeer(opts.UID, opts.Code, iceServers, opts.ForceRelay, opts.Verbose)
 	if err != nil {
 		sig.Close()
 		return nil, err

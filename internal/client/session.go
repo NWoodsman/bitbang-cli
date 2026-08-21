@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -17,7 +18,9 @@ import (
 // stderr is the package-wide log sink for connection progress + debug
 // chatter. cp prints user-facing data to stdout, so all diagnostic noise
 // from this package routes here instead.
-var stderr = os.Stderr
+// io.Writer rather than *os.File so a test can capture what the user
+// would have seen.
+var stderr io.Writer = os.Stderr
 
 var (
 	errStreamQueueFull       = errors.New("stream receive queue full")
@@ -662,6 +665,24 @@ func (s *Session) handleControl(frame protocol.Frame) bool {
 			return true
 		}
 		st.updateSendLimit(update.MaxBytes)
+		return true
+
+	case "error":
+		// A listener can end a session at any point and say why -- an
+		// access link revoked or expired while the session was open. The
+		// handshake loop has its own "error" case; this one is for a
+		// message that arrives after ready, where there is no handshake
+		// left to fail. Print it, then let the teardown fall out of the
+		// data channel closing behind it.
+		var msg struct {
+			Message string `json:"message"`
+		}
+		_ = json.Unmarshal(frame.Payload, &msg)
+		if msg.Message == "" {
+			msg.Message = "listener ended the session"
+		}
+		fmt.Fprintf(stderr, "bitbang: %s\n", msg.Message)
+		s.finishStreams()
 		return true
 
 	case protocol.ControlStreamReset:

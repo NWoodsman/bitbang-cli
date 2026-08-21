@@ -177,7 +177,7 @@ func TestRoleSlots(t *testing.T) {
 
 func TestSharePeerTeardownReleasesOnce(t *testing.T) {
 	var released atomic.Int32
-	p := &sharePeer{}
+	p := newSharePeer("test-client")
 	p.hold(func() { released.Add(1) })
 
 	var wins atomic.Int32
@@ -202,7 +202,7 @@ func TestSharePeerTeardownReleasesOnce(t *testing.T) {
 
 func TestSharePeerAdmissionRaceReturnsSlot(t *testing.T) {
 	slots := newRoleSlots(1, "full")
-	p := &sharePeer{}
+	p := newSharePeer("test-client")
 	release, _ := slots.acquire()
 	p.teardown()
 	if !p.hold(release) {
@@ -215,7 +215,7 @@ func TestSharePeerAdmissionRaceReturnsSlot(t *testing.T) {
 
 func TestSharePeerEstablishmentDeadlineCanBeCanceled(t *testing.T) {
 	expired := make(chan struct{})
-	p := &sharePeer{}
+	p := newSharePeer("test-client")
 	p.armEstablishment(20*time.Millisecond, func() { close(expired) })
 	p.markEstablished()
 	select {
@@ -230,7 +230,7 @@ func TestSharePeerTeardownClosesPublishedShell(t *testing.T) {
 	marker := filepath.Join(t.TempDir(), "started")
 	sh := streamtype.NewShell(nil, false)
 	sh.ForcedArgv = []string{"/bin/sh", "-c", "touch \"$0\"", marker}
-	p := &sharePeer{}
+	p := newSharePeer("test-client")
 	if !p.publish(sh, &session.Session{}) {
 		t.Fatal("live peer refused publication")
 	}
@@ -250,7 +250,7 @@ func TestSharePeerTeardownClosesPublishedShell(t *testing.T) {
 
 func TestSharePeerPublishRacesTeardown(t *testing.T) {
 	for i := 0; i < 200; i++ {
-		p := &sharePeer{}
+		p := newSharePeer("test-client")
 		sh := streamtype.NewShell(nil, false)
 		var wg sync.WaitGroup
 		var published bool
@@ -265,10 +265,12 @@ func TestSharePeerPublishRacesTeardown(t *testing.T) {
 		}()
 		wg.Wait()
 
-		p.mu.Lock()
-		installed := p.shell
-		closed := p.closed
-		p.mu.Unlock()
+		var installed *streamtype.ShellHandler
+		var closed bool
+		p.q.Locked(func(isClosed bool) {
+			installed = p.shell
+			closed = isClosed
+		})
 		if !closed || published != (installed == sh) {
 			t.Fatalf("iteration %d: published=%v installed=%v closed=%v", i, published, installed == sh, closed)
 		}
@@ -293,11 +295,11 @@ func TestPublishDoesNotDrainOnCallerGoroutine(t *testing.T) {
 	release := make(chan struct{})
 	var once sync.Once
 
-	p := &sharePeer{}
-	p.deliver = func([]byte) {
+	p := newSharePeer("test-client")
+	p.q.SetDeliver(func([]byte) {
 		once.Do(func() { close(blocked) })
 		<-release
-	}
+	})
 	defer close(release)
 
 	// A frame is already queued, so the drain has something to park on.
@@ -333,14 +335,14 @@ func TestDrainStopsOnTeardown(t *testing.T) {
 	started := make(chan struct{}, queued)
 	proceed := make(chan struct{})
 
-	p := &sharePeer{}
-	p.deliver = func([]byte) {
+	p := newSharePeer("test-client")
+	p.q.SetDeliver(func([]byte) {
 		mu.Lock()
 		delivered++
 		mu.Unlock()
 		started <- struct{}{}
 		<-proceed
-	}
+	})
 	for i := 0; i < queued; i++ {
 		p.handleMessage([]byte("frame"))
 	}
@@ -361,14 +363,95 @@ func TestDrainStopsOnTeardown(t *testing.T) {
 	// starts and cleared in its defer, so once it is false the count is
 	// final and cannot grow under a slower machine.
 	waitFor(t, "the drain goroutine to exit", func() bool {
-		p.mu.Lock()
-		defer p.mu.Unlock()
-		return !p.dispatching
+		return !p.q.Draining()
 	})
 	mu.Lock()
 	got := delivered
 	mu.Unlock()
 	if got != 1 {
 		t.Errorf("delivered %d of %d queued frames after teardown, want exactly the 1 already in flight", got, queued)
+	}
+}
+
+// The control credential is the keyboard: presenting it takes the
+// keyboard, rather than being told to wait for whoever has it. Refusing
+// the newcomer leaves them with no way in except to close a tab that may
+// be on a machine they walked away from.
+func TestControlSlotPreemptsTheIncumbent(t *testing.T) {
+	slot := newControlSlot("")
+	first := newSharePeer("first")
+	second := newSharePeer("second")
+
+	release1, evicted, refused := slot.take(first)
+	if release1 == nil || refused != "" {
+		t.Fatalf("first take refused: %q", refused)
+	}
+	if evicted != nil {
+		t.Error("an empty slot reported evicting someone")
+	}
+
+	release2, evicted, refused := slot.take(second)
+	if release2 == nil || refused != "" {
+		t.Fatalf("second take refused: %q -- the newcomer should win", refused)
+	}
+	if evicted != first {
+		t.Fatalf("evicted = %v, want the peer that held the slot", evicted)
+	}
+
+	// The displaced peer tears down after the newcomer already holds the
+	// slot. Its release must not evict the newcomer.
+	release1()
+	if _, evicted, _ := slot.take(newSharePeer("third")); evicted != second {
+		t.Error("a preempted peer's late release gave away the live controller's slot")
+	}
+}
+
+func TestControlSlotDisabledRefusesEveryone(t *testing.T) {
+	slot := newControlSlot("this share is view-only")
+	release, evicted, refused := slot.take(newSharePeer("a"))
+	if release != nil || evicted != nil {
+		t.Error("a disabled control slot admitted a peer")
+	}
+	if refused != "this share is view-only" {
+		t.Errorf("refusal = %q, want the configured reason", refused)
+	}
+}
+
+// Two connections presenting the control credential at the same instant
+// must leave exactly one holder, and every displaced peer must be
+// reported so the worker can end its session.
+func TestControlSlotRacingTakes(t *testing.T) {
+	for i := 0; i < 200; i++ {
+		slot := newControlSlot("")
+		a, b := newSharePeer("a"), newSharePeer("b")
+		var wg sync.WaitGroup
+		var mu sync.Mutex
+		evictions := 0
+
+		wg.Add(2)
+		for _, p := range []*sharePeer{a, b} {
+			go func(p *sharePeer) {
+				defer wg.Done()
+				if _, evicted, _ := slot.take(p); evicted != nil {
+					mu.Lock()
+					evictions++
+					mu.Unlock()
+				}
+			}(p)
+		}
+		wg.Wait()
+
+		slot.mu.Lock()
+		holder := slot.holder
+		slot.mu.Unlock()
+		if holder != a && holder != b {
+			t.Fatalf("iteration %d: slot holds neither peer", i)
+		}
+		// Whoever arrived second displaced the first, so exactly one
+		// eviction; if both saw an empty slot, one controller was left
+		// running with nobody to end it.
+		if evictions != 1 {
+			t.Fatalf("iteration %d: %d evictions, want exactly 1", i, evictions)
+		}
 	}
 }

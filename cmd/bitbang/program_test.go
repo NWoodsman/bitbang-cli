@@ -4,34 +4,36 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/richlegrand/bitbang/internal/links"
 )
 
 func TestDeriveProgram(t *testing.T) {
 	// Shell-bearing configs collapse to the master "bitbang" identity.
-	all := serveConfig{shellEnabled: true, filesEnabled: true, proxyEnabled: true}
+	all := serveConfig{caps: capsOf(links.ScopeShell, links.ScopeForward, links.ScopeFiles, links.ScopeProxy)}
 	if got := deriveProgram(all); got != "bitbang" {
 		t.Errorf("all-caps serve: got %q, want \"bitbang\"", got)
 	}
-	if got := deriveProgram(serveConfig{shellEnabled: true}); got != "bitbang" {
+	if got := deriveProgram(serveConfig{caps: capsOf(links.ScopeShell, links.ScopeForward)}); got != "bitbang" {
 		t.Errorf("shell-only: got %q, want \"bitbang\"", got)
 	}
 
 	// Generic single caps get their own stable identity.
-	if got := deriveProgram(serveConfig{proxyEnabled: true}); got != "proxy" {
+	if got := deriveProgram(serveConfig{caps: capsOf(links.ScopeProxy)}); got != "proxy" {
 		t.Errorf("generic proxy: got %q, want \"proxy\"", got)
 	}
-	if got := deriveProgram(serveConfig{filesEnabled: true}); got != "files" {
+	if got := deriveProgram(serveConfig{caps: capsOf(links.ScopeFiles)}); got != "files" {
 		t.Errorf("generic files: got %q, want \"files\"", got)
 	}
 
 	// An explicit --program always wins.
-	if got := deriveProgram(serveConfig{shellEnabled: true, program: "custom"}); got != "custom" {
+	if got := deriveProgram(serveConfig{caps: capsOf(links.ScopeShell, links.ScopeForward), program: "custom"}); got != "custom" {
 		t.Errorf("explicit program override: got %q, want \"custom\"", got)
 	}
 
 	// Fixed proxy target → per-target identity, prefixed and readable.
-	p1 := deriveProgram(serveConfig{proxyEnabled: true, target: "localhost:8096"})
-	p2 := deriveProgram(serveConfig{proxyEnabled: true, target: "localhost:3000"})
+	p1 := deriveProgram(serveConfig{caps: capsOf(links.ScopeProxy), target: "localhost:8096"})
+	p2 := deriveProgram(serveConfig{caps: capsOf(links.ScopeProxy), target: "localhost:3000"})
 	if !strings.HasPrefix(p1, "proxy-localhost-8096-") {
 		t.Errorf("proxy target slug not readable: %q", p1)
 	}
@@ -40,15 +42,15 @@ func TestDeriveProgram(t *testing.T) {
 	}
 
 	// Trivially-equivalent targets normalize to the SAME identity.
-	if a, b := deriveProgram(serveConfig{proxyEnabled: true, target: "LocalHost:8096/"}),
-		deriveProgram(serveConfig{proxyEnabled: true, target: "localhost:8096"}); a != b {
+	if a, b := deriveProgram(serveConfig{caps: capsOf(links.ScopeProxy), target: "LocalHost:8096/"}),
+		deriveProgram(serveConfig{caps: capsOf(links.ScopeProxy), target: "localhost:8096"}); a != b {
 		t.Errorf("equivalent targets must share identity: %q != %q", a, b)
 	}
 
 	// Equivalent file paths (relative vs absolute) share one identity.
 	abs, _ := filepath.Abs(".")
-	if a, b := deriveProgram(serveConfig{filesEnabled: true, filesPath: "."}),
-		deriveProgram(serveConfig{filesEnabled: true, filesPath: abs}); a != b {
+	if a, b := deriveProgram(serveConfig{caps: capsOf(links.ScopeFiles), filesPath: "."}),
+		deriveProgram(serveConfig{caps: capsOf(links.ScopeFiles), filesPath: abs}); a != b {
 		t.Errorf("equivalent paths must share identity: %q != %q", a, b)
 	}
 }

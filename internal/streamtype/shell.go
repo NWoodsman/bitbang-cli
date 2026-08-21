@@ -4,14 +4,12 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
-	"fmt"
 	"io"
 	"log"
 	"os"
 	"os/exec"
 	"regexp"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -33,12 +31,90 @@ const (
 	ansiReset    = "\x1b[0m"
 )
 
-// activeShellCount is the process-wide count of in-flight shell
-// streams across all sessions. Used by MaxConcurrent enforcement on
-// ShellHandler. Lives at package scope because each WebRTC peer
-// creates its own ShellHandler instance; the limit needs to apply
-// across all of them.
-var activeShellCount atomic.Int32
+// liveShells records the in-flight shell streams across all sessions, in
+// the order they were admitted. Package scope because each WebRTC peer
+// creates its own ShellHandler instance and the MaxConcurrent limit has
+// to apply across all of them.
+var liveShells shellAdmissions
+
+// shellAdmissions enforces MaxConcurrent by displacing the oldest shell
+// rather than turning the newcomer away.
+//
+// Refusing was the original behavior and it strands the person holding
+// the credential: with the default of one session, a shell left open on
+// a machine they walked away from locks them out of their own listener,
+// and nothing short of finding that machine gets them back in. The limit
+// is a posture -- how many shells may be live at once -- not a
+// first-come claim on the listener, and displacing the oldest keeps the
+// posture while letting the newcomer in. `bitbang share` resolves the
+// same contention the same way.
+type shellAdmissions struct {
+	mu   sync.Mutex
+	live []*shellAdmission
+}
+
+// shellAdmission is one live shell and how to end it early.
+type shellAdmission struct {
+	// evict ends this shell, telling its connector why first. Assigned
+	// after the process spawns, so it is read under the list's lock.
+	evict func()
+}
+
+// admit registers a shell and reports which one it displaced, if any.
+// The caller evicts that one outside the lock, because ending a shell
+// waits on a process and this lock is on every admission path.
+//
+// The displaced shell gives up its slot at the moment it is displaced,
+// not when its process finally exits -- otherwise a third arrival would
+// throw out the newcomer merely because the first one was slow to die.
+// Its own release later finds nothing and is a no-op. Two processes do
+// overlap briefly while the old one is terminating; blocking a new
+// admission until it exits would be worse, since OnSYN runs on the
+// session's dispatch path.
+func (a *shellAdmissions) admit(max int) (adm *shellAdmission, displaced *shellAdmission) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	adm = &shellAdmission{}
+	if max > 0 && len(a.live) >= max {
+		displaced = a.live[0]
+		a.live = a.live[1:]
+	}
+	a.live = append(a.live, adm)
+	return adm, displaced
+}
+
+// release drops an admission when its stream ends. Safe to call for one
+// already displaced.
+func (a *shellAdmissions) release(adm *shellAdmission) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for i, live := range a.live {
+		if live == adm {
+			a.live = append(a.live[:i], a.live[i+1:]...)
+			return
+		}
+	}
+}
+
+// count is the number of live shells, for tests.
+func (a *shellAdmissions) count() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return len(a.live)
+}
+
+// setEvict attaches the teardown once the process exists.
+func (a *shellAdmissions) setEvict(adm *shellAdmission, evict func()) {
+	a.mu.Lock()
+	adm.evict = evict
+	a.mu.Unlock()
+}
+
+func (a *shellAdmissions) evictFunc(adm *shellAdmission) func() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return adm.evict
+}
 
 const (
 	maxShellBuffered        uint64 = 8 << 20
@@ -298,8 +374,12 @@ type shellSession struct {
 	process *os.Process    // process behind either command type
 	ptyFile ptylib.Pty     // PTY mode: master side, used for read + write
 	stdin   io.WriteCloser // pipe mode: dedicated stdin pipe
-	output  *shellOutput   // drain output before FIN and terminal close
-	done    chan struct{}
+	// pipes are the read ends we own in pipe mode. Closed once output is
+	// drained, which also unblocks a pump still waiting on a descriptor
+	// some grandchild inherited and kept open.
+	pipes  []*os.File
+	output *shellOutput // drain output before FIN and terminal close
+	done   chan struct{}
 }
 
 func (s *shellSession) wait() error {
@@ -430,11 +510,12 @@ func (h *ShellHandler) OnSYN(s Stream, payload []byte, final bool) error {
 	}
 
 	// Admission gate. AcquireSlot (caller-owned policy) wins when set;
-	// otherwise the process-wide MaxConcurrent atomic. Either way,
+	// otherwise the process-wide MaxConcurrent list. Either way,
 	// `release` owns the slot: the defer below releases it on any
 	// early-return path (spawn failed or bad config) and is cleared
 	// once waitAndFinish is launched and assumes ownership.
 	var release func()
+	var admission *shellAdmission
 	if h.AcquireSlot != nil {
 		rel, errMsg := h.AcquireSlot()
 		if rel == nil {
@@ -444,13 +525,15 @@ func (h *ShellHandler) OnSYN(s Stream, payload []byte, final bool) error {
 		}
 		release = rel
 	} else if h.MaxConcurrent > 0 {
-		if int(activeShellCount.Add(1)) > h.MaxConcurrent {
-			activeShellCount.Add(-1)
-			log.Printf("Shell rejected: at max-sessions=%d", h.MaxConcurrent)
-			h.sendShellError(s, fmt.Sprintf("listener is busy (max %d concurrent shell session(s))", h.MaxConcurrent))
-			return nil
+		adm, displaced := liveShells.admit(h.MaxConcurrent)
+		if displaced != nil {
+			log.Printf("Shell displaced an older session: at max-sessions=%d", h.MaxConcurrent)
+			if evict := liveShells.evictFunc(displaced); evict != nil {
+				go evict()
+			}
 		}
-		release = func() { activeShellCount.Add(-1) }
+		admission = adm
+		release = func() { liveShells.release(adm) }
 	}
 	deferredRelease := release
 	defer func() {
@@ -562,39 +645,67 @@ func (h *ShellHandler) OnSYN(s Stream, payload []byte, final bool) error {
 			h.sendShellError(s, "stdin pipe: "+err.Error())
 			return nil
 		}
-		sout, err := cmd.StdoutPipe()
+		// os.Pipe rather than cmd.StdoutPipe: Wait closes the pipes
+		// StdoutPipe hands out, and it runs concurrently with the pumps
+		// reading them, so a command that exits before its pump is
+		// scheduled loses its output outright. Owning both ends means
+		// Wait cannot take the read end away mid-read, and EOF still
+		// arrives on its own once every writer is gone -- the child's
+		// copy when it exits, ours immediately after Start.
+		outR, outW, err := os.Pipe()
 		if err != nil {
 			_ = sin.Close()
 			h.mu.Unlock()
 			h.sendShellError(s, "stdout pipe: "+err.Error())
 			return nil
 		}
-		serr, err := cmd.StderrPipe()
+		errR, errW, err := os.Pipe()
 		if err != nil {
 			_ = sin.Close()
+			_ = outR.Close()
+			_ = outW.Close()
 			h.mu.Unlock()
 			h.sendShellError(s, "stderr pipe: "+err.Error())
 			return nil
 		}
+		cmd.Stdout = outW
+		cmd.Stderr = errW
 		if err := cmd.Start(); err != nil {
-			// Wait never runs, so the parent ends of the pipes are
-			// ours to close.
 			_ = sin.Close()
-			_ = sout.Close()
-			_ = serr.Close()
+			_ = outR.Close()
+			_ = outW.Close()
+			_ = errR.Close()
+			_ = errW.Close()
 			h.mu.Unlock()
 			h.sendShellError(s, "spawn failed: "+err.Error())
 			return nil
 		}
+		// The child holds its own copies now. Dropping ours is what
+		// lets the reader see EOF when the child goes.
+		_ = outW.Close()
+		_ = errW.Close()
 		sess.cmd = cmd
 		sess.process = cmd.Process
 		sess.stdin = sin
-		stdout = sout
-		stderr = serr
+		sess.pipes = []*os.File{outR, errR}
+		stdout = outR
+		stderr = errR
 	}
 
 	h.streams[s.ID()] = sess
 	h.mu.Unlock()
+
+	// The admission can now end this shell if a later one displaces it.
+	// Tell the connector before killing the process, or all they see is
+	// their shell dying for no stated reason.
+	if admission != nil {
+		liveShells.setEvict(admission, func() {
+			h.sendShellError(s, "another connection took the shell")
+			if sess.process != nil {
+				_ = terminateShellProcess(sess.process)
+			}
+		})
+	}
 
 	log.Printf("Shell started: argv=%v pty=%v", argv, ptyMode)
 
@@ -798,6 +909,12 @@ func (h *ShellHandler) waitAndFinish(s Stream, running *shellSession, argv []str
 	}
 	if !drained {
 		log.Printf("Shell output drain timed out: argv=%v", argv)
+	}
+	// Now that the pumps are done with them -- or have been given up on
+	// -- release the read ends. A pump still blocked on one is unblocked
+	// by this, which is what Wait used to do before we owned them.
+	for _, f := range running.pipes {
+		_ = f.Close()
 	}
 
 	exitCode := 0

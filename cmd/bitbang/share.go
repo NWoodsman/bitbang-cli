@@ -73,7 +73,13 @@ type shareConfig struct {
 
 func registerShareFlags(fs *flag.FlagSet, cfg *shareConfig) {
 	fs.BoolVar(&cfg.readOnly, "read-only", false, "Viewers only -- no control credential is generated at all")
-	fs.StringVar(&cfg.ttl, "ttl", "1h", "Share lifetime (Go duration like 1h or 30m; 0 = until stopped)")
+	// Default 0 (until stopped) rather than a time limit. A share ends on
+	// `share stop`, removal of the source session, or preemption -- all of
+	// which are things the operator did. An expiry on top of those was a
+	// second, weaker answer to "when does access end", and that question is
+	// being answered properly by expiring access codes. --ttl stays for
+	// anyone who wants it.
+	fs.StringVar(&cfg.ttl, "ttl", "0", "Share lifetime (Go duration like 1h or 30m; default 0 = until stopped)")
 	fs.StringVar(&cfg.target, "target", "", "tmux session to share (name or $id; default: the session you're in)")
 	fs.StringVar(&cfg.socket, "socket", "", "tmux server socket path (default: the enclosing server, or tmux's default)")
 	fs.StringVar(&cfg.server, "server", "bitba.ng", "Signaling server hostname")

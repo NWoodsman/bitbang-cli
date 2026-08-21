@@ -4,31 +4,25 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
-	"sync/atomic"
-	"unicode/utf8"
 
 	"github.com/pion/webrtc/v4"
 	qrcode "github.com/skip2/go-qrcode"
-	"golang.org/x/term"
 
 	"github.com/richlegrand/bitbang/internal/auth"
 	"github.com/richlegrand/bitbang/internal/fileshare"
 	"github.com/richlegrand/bitbang/internal/icehelper"
 	"github.com/richlegrand/bitbang/internal/identity"
-	"github.com/richlegrand/bitbang/internal/pairing"
-	"github.com/richlegrand/bitbang/internal/peer"
-	"github.com/richlegrand/bitbang/internal/proxyweb"
-	"github.com/richlegrand/bitbang/internal/session"
-	"github.com/richlegrand/bitbang/internal/shellweb"
+	"github.com/richlegrand/bitbang/internal/links"
+	"github.com/richlegrand/bitbang/internal/peerset"
 	"github.com/richlegrand/bitbang/internal/signaling"
-	"github.com/richlegrand/bitbang/internal/streamtype"
 	"github.com/richlegrand/bitbang/internal/videohelper"
 )
+
+// defaultServer is the signaling host every command defaults to.
+const defaultServer = "bitba.ng"
 
 // maxUnauthSessions bounds how many sessions may sit pre-PIN-auth at once,
 // limiting parallel brute-force. A single human needs exactly one.
@@ -73,17 +67,18 @@ type serveConfig struct {
 	// case doesn't trip OctoPrint's "external access" warning needlessly.
 	forwardClientIP bool
 
-	// Caps actually enabled in this mode.
-	shellEnabled bool
-	filesEnabled bool
-	proxyEnabled bool
+	// caps is what this mode offers, named in the scope vocabulary links
+	// uses. It is the only place the cap set is written down: what to
+	// build, what to mount, what to advertise, and what a link may be
+	// scoped to all derive from it. See capability.go.
+	caps capSet
 
-	// Shell-cap configuration (only set when shellEnabled).
+	// Shell-cap configuration (only meaningful when caps includes shell).
 	shellCmd         string
 	shellMaxSessions int
 	shellMirror      bool
 
-	// Files-cap configuration (only set when filesEnabled).
+	// Files-cap configuration (only meaningful when caps includes files).
 	filesPath   string
 	filesUpload bool
 
@@ -99,7 +94,7 @@ type serveConfig struct {
 // everything I can get from a single listener" entry point.
 func runServe(args []string) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
-	cfg := serveConfig{shellEnabled: true, filesEnabled: true, proxyEnabled: true}
+	cfg := serveConfig{caps: capsOf(links.ScopeShell, links.ScopeForward, links.ScopeFiles, links.ScopeProxy)}
 	registerSharedFlags(fs, &cfg)
 	registerShellFlags(fs, &cfg)
 	fs.StringVar(&cfg.filesPath, "files", "", "Files path (default: current working directory)")
@@ -123,7 +118,9 @@ func runServe(args []string) {
 // connectors. No hamburger; the entire browser tab is the shell.
 func runServeShell(args []string) {
 	fs := flag.NewFlagSet("serve shell", flag.ExitOnError)
-	cfg := serveConfig{shellEnabled: true}
+	// forward rides with shell: `serve shell` offers port forwarding too,
+	// and saying so here beats deriving it from where NewTCP is called.
+	cfg := serveConfig{caps: capsOf(links.ScopeShell, links.ScopeForward)}
 	registerSharedFlags(fs, &cfg)
 	registerShellFlags(fs, &cfg)
 	fs.Parse(reorderArgs(fs, args))
@@ -135,7 +132,7 @@ func runServeShell(args []string) {
 // file browser.
 func runServeFiles(args []string) {
 	fs := flag.NewFlagSet("serve files", flag.ExitOnError)
-	cfg := serveConfig{filesEnabled: true}
+	cfg := serveConfig{caps: capsOf(links.ScopeFiles)}
 	registerSharedFlags(fs, &cfg)
 	fs.BoolVar(&cfg.filesUpload, "upload", false, "Allow uploads to the shared directory")
 
@@ -170,7 +167,7 @@ func runServeFiles(args []string) {
 // wins — the user typed it more explicitly.
 func runServeProxy(args []string) {
 	fs := flag.NewFlagSet("serve proxy", flag.ExitOnError)
-	cfg := serveConfig{proxyEnabled: true}
+	cfg := serveConfig{caps: capsOf(links.ScopeProxy)}
 	registerSharedFlags(fs, &cfg)
 	fs.Parse(reorderArgs(fs, args))
 
@@ -193,7 +190,7 @@ func runServeProxy(args []string) {
 // mode. They have the same semantics across all four runServe*
 // functions, so factor them out.
 func registerSharedFlags(fs *flag.FlagSet, cfg *serveConfig) {
-	fs.StringVar(&cfg.server, "server", "bitba.ng", "Signaling server hostname")
+	fs.StringVar(&cfg.server, "server", defaultServer, "Signaling server hostname")
 	fs.StringVar(&cfg.pin, "pin", "", "PIN to protect access")
 	fs.BoolVar(&cfg.ephemeral, "ephemeral", false, "Use a temporary identity")
 	fs.BoolVar(&cfg.verbose, "v", false, "Verbose logging")
@@ -278,7 +275,7 @@ func smallQR(url string) string {
 func startListener(cfg serveConfig) {
 	// Build the file share if files enabled.
 	var share *fileshare.FileShare
-	if cfg.filesEnabled {
+	if cfg.caps.has(links.ScopeFiles) {
 		s, err := fileshare.New(cfg.filesPath)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Cannot share %q: %v\n", cfg.filesPath, err)
@@ -358,9 +355,6 @@ func startListener(cfg serveConfig) {
 		log.Printf("Video helper attached on fd %d", cfg.videoFD)
 	}
 
-	httpFront := buildServeHTTPHandler(share, cfg.shellEnabled, cfg.proxyEnabled,
-		cfg.shellMaxSessions, isAllMode(cfg))
-
 	signalingClient := signaling.NewClient(cfg.server, id)
 	signalingClient.OwnICEServers = cfg.iceServers
 	signalingClient.Verbose = cfg.verbose
@@ -375,96 +369,47 @@ func startListener(cfg serveConfig) {
 	}
 	url := signalingClient.URL(cfg.verbose)
 
-	stdoutIsTTY := term.IsTerminal(int(os.Stdout.Fd()))
-	termWidth := 0
-	if w, _, err := term.GetSize(int(os.Stdout.Fd())); err == nil {
-		termWidth = w
-	}
-	bold, reset := "", ""
-	if stdoutIsTTY {
-		bold, reset = "\033[1m", "\033[0m"
-	}
-
-	// printReady renders the banner, QR code, and URL. On a wide TTY the
-	// banner sits to the right of the QR (vertically centered) so the whole
-	// startup block stays short enough to fit on one screen — handy for a
-	// screen recording. On a narrow or non-TTY output it falls back to the
-	// banner stacked above the QR so pipes, logs, and tests stay readable.
-	printReady := func() {
-		qr := smallQR(url)
-		bannerLines := strings.Split(strings.TrimRight(banner, "\n"), "\n")
-		bannerLines = append(bannerLines, "bitbang-cli v"+version)
-		var qrLines []string
-		if qr != "" {
-			qrLines = strings.Split(strings.TrimRight(qr, "\n"), "\n")
-		}
-
-		bannerWidth := 0
-		for _, l := range bannerLines {
-			if w := utf8.RuneCountInString(l); w > bannerWidth {
-				bannerWidth = w
-			}
-		}
-		const gap = "   "
-		qrWidth := 0
-		if len(qrLines) > 0 {
-			qrWidth = utf8.RuneCountInString(qrLines[0])
-		}
-
-		if len(qrLines) > 0 && stdoutIsTTY && termWidth >= qrWidth+len(gap)+bannerWidth {
-			// QR flush left keeps its quiet zone against the terminal margin;
-			// the banner is centered vertically against the taller QR block.
-			off := (len(qrLines) - len(bannerLines)) / 2
-			if off < 0 {
-				off = 0
-			}
-			for i, ql := range qrLines {
-				if bi := i - off; bi >= 0 && bi < len(bannerLines) {
-					fmt.Println(ql + gap + bannerLines[bi])
-				} else {
-					fmt.Println(ql)
-				}
-			}
-		} else {
-			for _, l := range bannerLines {
-				fmt.Println(l)
-			}
-			fmt.Println()
-			fmt.Print(qr)
-		}
-		fmt.Printf("URL: %s%s%s\n", bold, url, reset)
+	// The link table lives beside the identity, so it is per program:
+	// `serve files -files /srv` and `serve all` derive different program
+	// names and therefore have separate tables. An ephemeral identity has
+	// no directory to keep one in, so it runs on the implicit row alone.
+	linkState, err := newLinkState(program, offeredScopes(cfg), id.Code,
+		cfg.ephemeral, signalingClient.CodeURL)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Link table error: %v\n", err)
+		os.Exit(1)
 	}
 
-	// printPairCode renders the issued pairing code on its own line —
-	// the operator shares this verbally so the connector can pair
-	// without the full UID URL. Code may be empty when (a) --nocode is
-	// set, or (b) the server lacks pairing support. In either case the
-	// URL flow still works; we just don't surface a code. Bolded on a
-	// TTY so it's easy to spot in the startup block; plain on pipes
-	// so log scrapers/tests aren't confused by escape sequences.
-	printPairCode := func() {
-		if signalingClient.PairingCode != "" {
-			fmt.Printf("%sPairing code: %s%s (valid 5 minutes)\n", bold, signalingClient.PairingCode, reset)
-		}
-	}
-
-	printReady()
-	printSharingBlock(cfg, share)
+	out := newConsole(url)
+	out.ready()
+	printSharingBlock(os.Stdout, cfg, share)
 
 	// PIN status / shell-without-PIN warning.
 	if pinAuth.Required() {
 		fmt.Println("PIN protection enabled.")
-	} else if cfg.shellEnabled {
-		fmt.Fprintf(os.Stderr, "%sWarning: anyone with this URL gets a shell and unrestricted TCP access from this machine.%s\n", bold, reset)
+	} else if cfg.caps.has(links.ScopeShell) {
+		fmt.Fprintf(os.Stderr, "%sWarning: anyone with this URL gets a shell and unrestricted TCP access from this machine.%s\n", out.bold, out.reset)
 		fmt.Fprintln(os.Stderr, "  Use --pin <PIN> for a second factor, or pick a non-shell mode.")
 	}
 
-	var mu sync.Mutex
-	connections := make(map[string]*peer.Connection)
+	if listing := linkState.listing(out.bold, out.reset); listing != "" {
+		fmt.Print(listing)
+		fmt.Print(reloadHint())
+	}
 
-	// unauthSessions counts live sessions that haven't completed the PIN
-	// handshake. Bounds parallel brute-force; released on auth or close.
-	var unauthSessions atomic.Int32
+	l := &listener{
+		cfg:       cfg,
+		id:        id,
+		share:     share,
+		shellArgv: shellArgv,
+		pinAuth:   pinAuth,
+		signaling: signalingClient,
+		links:     linkState,
+		video:     videoClient,
+		peers:     peerset.New[*servePeer](),
+	}
+
+	l.watch(out.bold, out.reset)
 
 	firstReady := true
 	signalingClient.OnReady = func() {
@@ -473,416 +418,16 @@ func startListener(cfg serveConfig) {
 			// First-ready: URL/QR was already printed above (synchronously,
 			// before Connect). Print just the pair code now that we've
 			// learned it from the registered reply.
-			printPairCode()
+			out.pairCode(signalingClient.PairingCode)
 			return
 		}
 		// Reconnect: re-print URL+QR (operator may have scrolled past it
 		// during a long-running session) and the freshly-issued code.
-		printReady()
-		printPairCode()
+		out.ready()
+		out.pairCode(signalingClient.PairingCode)
 	}
 
-	signalingClient.Connect(func(msg signaling.Message) {
-		msgType, _ := msg["type"].(string)
-
-		switch msgType {
-		case "request":
-			clientID, _ := msg["client_id"].(string)
-			mu.Lock()
-			duplicate := connections[clientID] != nil
-			mu.Unlock()
-			if clientID == "" || duplicate {
-				log.Printf("Rejecting duplicate or empty client ID %q", clientID)
-				return
-			}
-			// Real browser IP from the signaling server (never client-set);
-			// stamped as X-Forwarded-For on proxied requests so the backend
-			// sees the true origin instead of our localhost socket peer.
-			browserIP, _ := msg["browser_ip"].(string)
-
-			// Cap concurrent un-authenticated sessions to blunt parallel
-			// PIN brute-forcing. A connector must already hold the access
-			// code to get this far, but without a cap they could open many
-			// sessions at once and guess PINs in parallel. Authenticated
-			// sessions release their slot (see OnReady below), so legit
-			// users never hit this.
-			if unauthSessions.Load() >= maxUnauthSessions {
-				log.Printf("Rejecting connection from %s: too many pending sessions (%d)", clientID, maxUnauthSessions)
-				return
-			}
-
-			var handlers []streamtype.StreamHandler
-			if share != nil {
-				handlers = append(handlers, streamtype.NewFile(share, cfg.verbose))
-			}
-			var shellHandler *streamtype.ShellHandler
-			var tcpHandler *streamtype.TCPHandler
-			if cfg.shellEnabled {
-				shellHandler = streamtype.NewShell(shellArgv, cfg.verbose)
-				shellHandler.MaxConcurrent = cfg.shellMaxSessions
-				if cfg.shellMirror {
-					shellHandler.StdoutMirror = os.Stdout
-					shellHandler.StderrMirror = os.Stderr
-				}
-				handlers = append(handlers, shellHandler)
-				tcpHandler = streamtype.NewTCP(cfg.verbose)
-				handlers = append(handlers, tcpHandler)
-			}
-			// Fixed-target proxy-only mode (e.g. the OctoPrint plugin): every
-			// request goes straight to --target, so the plain device URL serves
-			// the app directly — no dispatcher, no landing page.
-			if cfg.proxyEnabled && cfg.target != "" && !cfg.shellEnabled && !cfg.filesEnabled {
-				// Only forward the client IP when explicitly enabled (the
-				// backend trusts localhost for auth); otherwise withhold it so
-				// requests look local and don't trip an external-access warning.
-				xffIP := ""
-				if cfg.forwardClientIP {
-					xffIP = browserIP
-				}
-				httpProxy := streamtype.NewHTTPProxy(cfg.target, id.UID, cfg.server, xffIP, cfg.verbose)
-				// Pair a WebSocket handler so ws:// streams resolve to the same
-				// target as HTTP (otherwise: "no handler for stream type websocket").
-				handlers = append(handlers, httpProxy,
-					streamtype.NewWebSocket(httpProxy, xffIP, cfg.verbose))
-			} else {
-				localHTTP := streamtype.NewHTTPLocal(httpFront, cfg.verbose)
-				var proxyHTTP streamtype.StreamHandler
-				if cfg.proxyEnabled {
-					// Dynamic-target mode: withhold browser_ip so we DON'T inject
-					// XFF. This mode proxies arbitrary LAN apps that may rely on
-					// requests appearing local; silently forwarding the real IP
-					// could break their access control. (Fixed-target/OctoPrint
-					// mode above passes it — there the backend is known.)
-					p := streamtype.NewHTTPProxy("", id.UID, cfg.server, "", cfg.verbose)
-					proxyHTTP = p
-					handlers = append(handlers, streamtype.NewWebSocket(p, "", cfg.verbose))
-				}
-				handlers = append(handlers, newHTTPDispatcher(localHTTP, proxyHTTP))
-			}
-
-			var sess *session.Session
-
-			conn, err := peer.HandleRequest(msg, signalingClient, id, func(data []byte) {
-				if sess != nil {
-					sess.HandleMessage(data)
-				}
-			}, cfg.verbose)
-			if err != nil {
-				log.Printf("Failed to create peer connection: %v", err)
-				return
-			}
-
-			sess = session.New(conn.DC, pinAuth, cfg.verbose, handlers...)
-
-			// Count this session against the unauth cap; release the slot
-			// exactly once, whichever comes first: it authenticates (OnReady)
-			// or it closes. sync.Once makes the double-path idempotent.
-			unauthSessions.Add(1)
-			var releaseOnce sync.Once
-			release := func() { releaseOnce.Do(func() { unauthSessions.Add(-1) }) }
-
-			forget := func() {
-				mu.Lock()
-				if connections[clientID] == conn {
-					delete(connections, clientID)
-				}
-				mu.Unlock()
-			}
-
-			// Neither of the release paths above can be reached by a peer
-			// that requests a connection and then goes quiet: with no SDP
-			// answer the connection never leaves WebRTC's `new` state, so
-			// there is no data channel to close and no terminal state to
-			// observe. Without a deadline, maxUnauthSessions such peers
-			// wedge the listener for good.
-			deadline := newDeadlineGuard(unreadyPeerTimeout, func() {
-				log.Printf("Dropping %s: handshake not completed within %s", clientID, unreadyPeerTimeout)
-				conn.Close()
-			})
-			sess.OnReady = func() {
-				deadline.Done()
-				release()
-			}
-
-			// Per-connection teardown, run when the data channel closes.
-			var onClose []func()
-			onClose = append(onClose, deadline.Done, sess.Close, release, forget)
-			// Kill any shell processes — without this they outlive the
-			// browser tab and keep holding their max-sessions slot.
-			if shellHandler != nil {
-				onClose = append(onClose, shellHandler.Close)
-			}
-			if tcpHandler != nil {
-				onClose = append(onClose, tcpHandler.CloseAll)
-			}
-			// Tear down the video PC and unregister the bridge.
-			if videoClient != nil {
-				// Forward the data PC's ICE servers so the video PC can use
-				// the same STUN/TURN (needed for peers with no direct path).
-				var iceServers []map[string]interface{}
-				if raw, ok := msg["ice_servers"].([]interface{}); ok {
-					for _, s := range raw {
-						if m, ok := s.(map[string]interface{}); ok {
-							iceServers = append(iceServers, m)
-						}
-					}
-				}
-				bridge := videoClient.Bridge(clientID, iceServers)
-				sess.SetVideoBridge(bridge)
-				onClose = append(onClose, bridge.Close)
-			}
-			mu.Lock()
-			connections[clientID] = conn
-			mu.Unlock()
-			conn.SetOnClose(func() {
-				for _, f := range onClose {
-					f()
-				}
-			})
-
-		case "answer":
-			clientID, _ := msg["client_id"].(string)
-			sdp, _ := msg["sdp"].(string)
-			mu.Lock()
-			conn := connections[clientID]
-			mu.Unlock()
-			if conn == nil {
-				return
-			}
-			// Pair-flow answers skip the bidirectional-verify decrypt —
-			// SAS comparison (run from the data-channel OnOpen) is the
-			// substitute, since the connector doesn't hold an access
-			// code yet to feed encrypted_request with.
-			if conn.PairingMode {
-				if err := conn.HandlePairAnswer(sdp); err != nil {
-					log.Printf("Failed to handle pair answer: %v", err)
-					conn.Close()
-				}
-				return
-			}
-			encrypted, _ := msg["encrypted_request"].(string)
-			if err := conn.HandleAnswer(sdp, encrypted); err != nil {
-				log.Printf("Failed to handle answer: %v", err)
-				conn.Close()
-			}
-
-		case "pair_request":
-			clientID, _ := msg["client_id"].(string)
-			if clientID == "" {
-				return
-			}
-			mu.Lock()
-			duplicate := connections[clientID] != nil
-			mu.Unlock()
-			if duplicate {
-				log.Printf("Rejecting duplicate pair client ID %q", clientID)
-				return
-			}
-			conn, err := peer.HandlePairRequest(msg, signalingClient, id,
-				pairing.DefaultTTYPrompt, cfg.verbose)
-			if err != nil {
-				log.Printf("Failed to handle pair request: %v", err)
-				return
-			}
-			mu.Lock()
-			connections[clientID] = conn
-			mu.Unlock()
-			deadline := newDeadlineGuard(unreadyPeerTimeout, func() {
-				log.Printf("Dropping pair %s: handshake not completed within %s", clientID, unreadyPeerTimeout)
-				conn.Close()
-			})
-			conn.SetOnClose(func() {
-				deadline.Done()
-				mu.Lock()
-				if connections[clientID] == conn {
-					delete(connections, clientID)
-				}
-				mu.Unlock()
-			})
-
-		case "candidate":
-			clientID, _ := msg["client_id"].(string)
-			candidateData, _ := msg["candidate"].(map[string]interface{})
-			mu.Lock()
-			conn := connections[clientID]
-			mu.Unlock()
-			if conn == nil {
-				return
-			}
-			_ = conn.AddICECandidate(candidateData)
-
-		case "error":
-			log.Printf("Signaling error: %v", msg["message"])
-		}
-	})
-}
-
-// isAllMode reports whether the listener is running in `serve` (all-
-// caps) mode rather than a single-cap mode. Used to gate the launcher
-// hamburger: only the all-mode launcher tab gets a cap bar.
-func isAllMode(cfg serveConfig) bool {
-	n := 0
-	if cfg.shellEnabled {
-		n++
-	}
-	if cfg.filesEnabled {
-		n++
-	}
-	if cfg.proxyEnabled {
-		n++
-	}
-	return n > 1
-}
-
-// launcherCapBarItems composes the dropdown for the all-mode launcher
-// tab. Shell appears only when --shell-max-sessions != 1 (otherwise
-// the main tab IS the only shell and offering another would just hit
-// the session limit). Files and Proxy always appear when enabled.
-//
-// Items render in this order. The bb-open-cap postMessage sends Path
-// up to bootstrap.js, which composes the new-tab URL using the secret
-// access code it owns.
-func launcherCapBarItems(share *fileshare.FileShare, shellEnabled, proxyEnabled bool, shellMaxSessions int) []shellweb.CapBarItem {
-	var items []shellweb.CapBarItem
-	if shellEnabled && shellMaxSessions != 1 {
-		items = append(items, shellweb.CapBarItem{Label: "Shell", Path: "/"})
-	}
-	if share != nil {
-		items = append(items, shellweb.CapBarItem{Label: "Files", Path: "/files/"})
-	}
-	if proxyEnabled {
-		items = append(items, shellweb.CapBarItem{Label: "Proxy", Path: "/proxy/"})
-	}
-	return items
-}
-
-// printSharingBlock prints the "Sharing:" status block listing each
-// enabled cap with its salient configuration.
-func printSharingBlock(cfg serveConfig, share *fileshare.FileShare) {
-	fmt.Println("Sharing:")
-	if cfg.shellEnabled {
-		shellLine := "  • shell  ("
-		if cfg.shellCmd != "" {
-			shellLine += cfg.shellCmd
-		} else {
-			shellLine += defaultShellLabel()
-		}
-		if cfg.shellMaxSessions == 0 {
-			shellLine += ", unlimited concurrent sessions"
-		} else if cfg.shellMaxSessions != 1 {
-			shellLine += fmt.Sprintf(", max %d concurrent sessions", cfg.shellMaxSessions)
-		}
-		if cfg.shellMirror {
-			shellLine += ", mirroring to console"
-		}
-		shellLine += ")"
-		fmt.Println(shellLine)
-		fmt.Printf("  • tcp    (unrestricted targets chosen by connect -L; max %d concurrent connections per session; loopback-bound on connector by default)\n", streamtype.DefaultTCPMaxConcurrent)
-	}
-	if cfg.filesEnabled && share != nil {
-		if share.Mode == fileshare.ModeSend {
-			fmt.Printf("  • files  (%s — single file)\n", share.FileName)
-		} else {
-			fileLine := fmt.Sprintf("  • files  (%s", share.BasePath)
-			if share.UploadEnabled {
-				fileLine += ", uploads enabled"
-			}
-			fileLine += ")"
-			fmt.Println(fileLine)
-		}
-	}
-	if cfg.proxyEnabled {
-		if cfg.target != "" {
-			fmt.Printf("  • proxy  (%s)\n", cfg.target)
-		} else {
-			fmt.Println("  • proxy  (target chosen in browser)")
-		}
-	}
-	fmt.Println()
-}
-
-// buildServeHTTPHandler composes the in-process HTTP-cap front-end.
-//
-// In all-mode: the launcher at "/" serves shellweb with the cap-bar
-// injected (hamburger + dropdown). "/shell/" serves plain shell (no
-// strip — that's a cap-specific tab opened via the hamburger). Files
-// at "/files/", proxy landing at "/proxy/".
-//
-// In single-cap modes: the cap's handler is served at "/" directly,
-// no strip, no prefix routing.
-//
-// Dynamic-target reverse proxying lives at the SWSP layer in
-// streamtype.HTTPHandler, dispatched by httpDispatcher based on the
-// connect path — those paths never reach this HTTP handler.
-func buildServeHTTPHandler(share *fileshare.FileShare, shellEnabled, proxyEnabled bool, shellMaxSessions int, allMode bool) http.Handler {
-	var fileH, shellH, proxyH http.Handler
-	if share != nil {
-		fileH = share.HTTPHandler()
-	}
-	if shellEnabled {
-		shellH = shellweb.New().HTTPHandler()
-	}
-	if proxyEnabled {
-		proxyH = proxyweb.LandingHandler()
-	}
-
-	// Single-cap fast path: serve the cap directly so relative URLs
-	// in its HTML resolve cleanly.
-	if !allMode {
-		switch {
-		case shellH != nil:
-			return shellH
-		case fileH != nil:
-			return fileH
-		case proxyH != nil:
-			return proxyH
-		}
-	}
-
-	// All-mode: build the launcher shell with the cap-bar strip
-	// injected. The strip's dropdown anchors postMessage parent to
-	// open new tabs (bootstrap.js handles the URL composition).
-	launcherItems := launcherCapBarItems(share, shellEnabled, proxyEnabled, shellMaxSessions)
-	launcherShell := shellweb.New(shellweb.WithCapBar(launcherItems)).HTTPHandler()
-
-	mux := http.NewServeMux()
-	capRoots := map[string]bool{}
-	if shellH != nil {
-		mux.Handle("/shell/", http.StripPrefix("/shell", shellH))
-		capRoots["/shell"] = true
-	}
-	if fileH != nil {
-		mux.Handle("/files/", http.StripPrefix("/files", fileH))
-		capRoots["/files"] = true
-	}
-	if proxyH != nil {
-		mux.Handle("/proxy/", http.StripPrefix("/proxy", proxyH))
-		capRoots["/proxy"] = true
-	}
-	// "/" is the launcher tab: shell + strip. (When proxy-only or
-	// files-only happens in some future all-mode variant where shell
-	// is disabled, fall through to that cap at root.)
-	switch {
-	case shellEnabled:
-		mux.Handle("/", launcherShell)
-	case fileH != nil:
-		mux.Handle("/", fileH)
-	case proxyH != nil:
-		mux.Handle("/", proxyH)
-	default:
-		mux.Handle("/", http.HandlerFunc(http.NotFound))
-	}
-
-	// Trailing-slash normalizer for the cap subpath roots. Without
-	// this, "/proxy" → 301 → "/proxy/", and the redirect's
-	// server-relative Location loses the browser's
-	// /__device__/<sessionId>/ prefix.
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if capRoots[r.URL.Path] {
-			r.URL.Path += "/"
-		}
-		mux.ServeHTTP(w, r)
-	})
+	signalingClient.Connect(l.handleSignal)
 }
 
 // resolveFSPath turns a user-supplied path into an absolute one,

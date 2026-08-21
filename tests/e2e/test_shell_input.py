@@ -4,71 +4,15 @@ This intentionally exercises the complete browser path: xterm.js, the injected
 WebSocket shim, bootstrap.js, WebRTC/SWSP, and the listener's PTY implementation.
 """
 
-import os
-import queue
-import re
-import subprocess
-import threading
-import time
-
 import pytest
 from playwright.sync_api import expect
 
 
-TEST_SERVER = os.environ.get("BITBANG_TEST_SERVER", "test.bitba.ng")
-
-
 @pytest.fixture(scope="module")
-def shell_url():
-    binary = os.environ.get("BITBANG_BIN")
-    if not binary or not os.path.isfile(binary):
-        pytest.skip("Set BITBANG_BIN to the bitbang executable under test")
-
-    proc = subprocess.Popen(
-        [binary, "serve", "shell", "-server", TEST_SERVER, "-ephemeral"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
-    lines = queue.Queue()
-
-    def pump():
-        for line in proc.stdout:
-            lines.put(line)
-        lines.put(None)
-
-    threading.Thread(target=pump, daemon=True).start()
-    url = None
-    ready = False
-    captured = []
-    deadline = time.time() + 30
-    while time.time() < deadline:
-        try:
-            line = lines.get(timeout=max(0.1, deadline - time.time()))
-        except queue.Empty:
-            break
-        if line is None:
-            break
-        captured.append(line)
-        match = re.search(r"URL:\s*(https://\S+)", line)
-        if match:
-            url = match.group(1)
-        if re.search(r"\bReady\b", line):
-            ready = True
-        if url and ready:
-            break
-
-    if not (url and ready):
-        proc.kill()
-        pytest.fail("shell listener did not start:\n" + "".join(captured))
-
-    yield url
-
-    proc.terminate()
-    try:
-        proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        proc.kill()
+def shell_url(listener, test_server):
+    """A shell-only listener. Ephemeral: this test has no link table, so it
+    runs on the identity's own code."""
+    return listener("serve", "shell", "-server", test_server, "-ephemeral").url
 
 
 def test_browser_keystrokes_reach_shell(shell_url, playwright):

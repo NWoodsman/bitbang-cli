@@ -417,6 +417,15 @@ func (s *Session) sendStreamFrame(streamID uint32, flags uint16, payload []byte)
 }
 
 // Close stops all per-stream workers and releases writers waiting for credit.
+// Closed reports whether the session has been shut down. Once true it
+// dispatches nothing further, which is what lets a listener revoke access
+// instantly and still take its time closing the connection underneath.
+func (s *Session) Closed() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.closed
+}
+
 func (s *Session) Close() {
 	s.close.Do(func() {
 		s.mu.Lock()
