@@ -28,19 +28,14 @@ func FromMessage(msg map[string]interface{}) []webrtc.ICEServer {
 	if raw == nil {
 		return nil
 	}
-	return AnyToICEServers(raw)
-}
-
-// AnyToICEServers converts an already-decoded ice_servers array to pion's
-// typed form. Re-marshaling and unmarshaling into a typed struct is the
-// simplest way across; a malformed entry yields nil.
-func AnyToICEServers(raw []any) []webrtc.ICEServer {
+	
 	data, err := json.Marshal(raw)
 	if err != nil {
 		return nil
 	}
 	return parseICEServers(data)
 }
+
 
 // parseICEServers decodes a JSON ice_servers array.
 //
