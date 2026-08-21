@@ -28,14 +28,13 @@ func FromMessage(msg map[string]interface{}) []webrtc.ICEServer {
 	if raw == nil {
 		return nil
 	}
-	
+
 	data, err := json.Marshal(raw)
 	if err != nil {
 		return nil
 	}
 	return parseICEServers(data)
 }
-
 
 // parseICEServers decodes a JSON ice_servers array.
 //
